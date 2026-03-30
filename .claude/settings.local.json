@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -v http://127.0.0.1:8000/api/settings/local-llm)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(curl -s http://localhost:3000/)"
+    ]
+  }
+}
