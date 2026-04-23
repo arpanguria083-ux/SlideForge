@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+backend/venv/
+backend/.venv/
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+
+# Build outputs
+backend/build/
+backend/static/
+backend/dist/
+*.pyc
+__pycache__/
+*.egg
+
+# Docs & unnecessary
+*.md
+*.docx
+docs/
+legal/
+.kilo/
+.claude/
+migrated_prompt_history/
+
+# IDE & local
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Env & secrets
+.env*
+!.env.example
+*.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test & coverage
+.coverage
+htmlcov/
+.pytest_cache/
