@@ -1143,7 +1143,7 @@
 
   // Close lightbox on background click
   document.getElementById('lightbox').addEventListener('click', function(e) {
-    if (e.target === this) closeLightbox();
+    if (e.target.id === 'lightbox') closeLightbox();
   });
 
   // Close on ESC key
