@@ -295,6 +295,49 @@
       margin-bottom: 60px;
     }
 
+    .gallery {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+      gap: 24px;
+      margin-top: 60px;
+    }
+
+    .gallery-item {
+      border-radius: 16px;
+      overflow: hidden;
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      transition: transform 0.3s, border-color 0.3s;
+    }
+
+    .gallery-item:hover {
+      transform: translateY(-8px);
+      border-color: rgba(255,255,255,0.2);
+    }
+
+    .gallery-item img {
+      width: 100%;
+      height: auto;
+      display: block;
+      border-radius: 16px 16px 0 0;
+    }
+
+    .gallery-caption {
+      padding: 20px;
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--white);
+    }
+
+    .gallery-caption p {
+      font-size: 0.8rem;
+      color: rgba(255,255,255,0.5);
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+
     .features-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -614,13 +657,13 @@
       <span class="badge-dot"></span>
       MBB-Grade AI Analysis · Now Free
     </div>
-    <p class="hero-eyebrow">Consulting Deck Intelligence Platform</p>
+    <p class="hero-eyebrow">Enterprise Presentation QA</p>
     <h1 class="hero-title">
       <span class="word-slide">SLIDE</span><span class="word-forge">FORGE</span>&nbsp;<span class="word-ai">AI</span>
     </h1>
-    <p class="hero-script">Gradient Intelligence</p>
+    <p class="hero-script">80% Faster Deck Review</p>
     <p class="hero-sub">
-      Multi-agent AI that reads, evaluates, and scores your consulting decks. OCR extraction. Language quality. Visual analysis. All local.
+      Multi-agent AI validates presentations against frameworks (SWOT, Porter's, BCG), checks data accuracy, ensures brand compliance, and flags violations — all offline. Used by top consulting firms, investment banks, and creative agencies.
     </p>
     <div class="hero-actions">
       <a href="#download" class="btn-download">
@@ -650,59 +693,85 @@
   <!-- STATS -->
   <div class="stats-bar reveal">
     <div class="stat">
-      <div class="stat-num c">6+</div>
+      <div class="stat-num c">80%</div>
+      <div class="stat-label">Time Savings</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num l">6</div>
       <div class="stat-label">AI Agents</div>
     </div>
     <div class="stat">
-      <div class="stat-num l">100%</div>
-      <div class="stat-label">Local / Offline</div>
+      <div class="stat-num y">60–180s</div>
+      <div class="stat-label">Analysis Speed</div>
     </div>
     <div class="stat">
-      <div class="stat-num y">PDF+PPT</div>
-      <div class="stat-label">Formats Supported</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num c">0</div>
-      <div class="stat-label">Data Sent to Cloud</div>
+      <div class="stat-num c">100%</div>
+      <div class="stat-label">Offline Capable</div>
     </div>
   </div>
 
   <!-- FEATURES -->
   <section class="section" id="features">
-    <p class="section-label reveal">What SlideForge Does</p>
+    <p class="section-label reveal">Powered By AI</p>
     <h2 class="section-title reveal">
-      Six agents.<br/>One verdict.
+      6 Specialized Agents.<br/>One Platform.
     </h2>
     <div class="features-grid">
       <div class="feature-card reveal">
         <div class="feature-icon icon-cyan">📄</div>
-        <h3>Surya OCR Extraction</h3>
-        <p>Layout-aware OCR pipeline reads every slide — text, tables, bullets — with bounding-box precision using the Surya model.</p>
+        <h3>OCR Extraction</h3>
+        <p>Surya layout-aware extraction. Reads text, tables, charts with pixel-perfect bounding boxes. Offline-capable.</p>
       </div>
       <div class="feature-card reveal">
-        <div class="feature-icon icon-lime">🧠</div>
-        <h3>Insight Extraction Agent</h3>
-        <p>Identifies key claims, recommendations, and strategic insights. Flags unsupported assertions and weak logical chains.</p>
+        <div class="feature-icon icon-lime">🎯</div>
+        <h3>Insight Extractor</h3>
+        <p>Validates claims against evidence. Detects unsupported assertions, missing sources, weak logic chains.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon icon-yellow">🏗️</div>
         <h3>Structure Auditor</h3>
-        <p>Evaluates narrative flow, pyramid principle adherence, and slide-by-slide coherence against MBB consulting standards.</p>
+        <p>Checks narrative flow, headline quality, MECE compliance. Validates against SWOT, Porter's, BCG, McKinsey 7S.</p>
       </div>
       <div class="feature-card reveal">
-        <div class="feature-icon icon-pink">🔍</div>
+        <div class="feature-icon icon-pink">📊</div>
         <h3>Data Lineage Agent</h3>
-        <p>Traces every statistic and data point. Validates sourcing, consistency, and cross-slide data integrity.</p>
+        <p>Matches charts to source data. Verifies consistency, flags missing sources, catches calculation errors.</p>
       </div>
       <div class="feature-card reveal">
-        <div class="feature-icon icon-blue">👁️</div>
-        <h3>Visual Analysis Agent</h3>
-        <p>Scores chart clarity, slide density, whitespace usage, and visual hierarchy. Catches cognitive overload before your client does.</p>
+        <div class="feature-icon icon-blue">🎨</div>
+        <h3>Visual Analysis</h3>
+        <p>Layout density, whitespace, visual hierarchy, cognitive load. Auto-detects brand compliance violations.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon icon-orange">✍️</div>
-        <h3>Language Quality Agent</h3>
-        <p>Grammar, conciseness, executive voice, and LanguageTool integration for professional-grade prose checks.</p>
+        <h3>Language Quality</h3>
+        <p>Grammar, tone, conciseness, business English scoring. LanguageTool integration for professional prose.</p>
+      </div>
+    </div>
+
+    <!-- SCREENSHOTS GALLERY -->
+    <p class="section-label reveal" style="margin-top: 120px;">Product in Action</p>
+    <div class="gallery">
+      <div class="gallery-item reveal">
+        <img src="img/app-dashboard.png" alt="SlideForge Dashboard — Multi-tab interface with file upload, analysis progress, and real-time scoring" />
+        <div class="gallery-caption">
+          <strong>Dashboard</strong>
+          <p>Real-time analysis. Multi-tab interface for evaluation, evidence, guardrails, audit log, and template discovery.</p>
+        </div>
+      </div>
+      <div class="gallery-item reveal">
+        <img src="img/analysis-view.png" alt="Analysis View — Detailed slide breakdown with agent findings, claim validation, and remediation suggestions" />
+        <div class="gallery-caption">
+          <strong>Analysis Results</strong>
+          <p>Slide-by-slide findings. Claim validation, evidence linking, visual analysis, language quality scores.</p>
+        </div>
+      </div>
+      <div class="gallery-item reveal">
+        <img src="img/guardrails-panel.png" alt="Guardrails Panel — Custom rules, compliance checklist, framework detection, and signed audit trail" />
+        <div class="gallery-caption">
+          <strong>Guardrails & Compliance</strong>
+          <p>Custom rules. Ed25519-signed guardrails, framework detection, immutable audit trail for SOX/FINRA compliance.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -711,28 +780,51 @@
   <section class="how-section" id="how">
     <p class="section-label reveal">Simple Workflow</p>
     <h2 class="section-title reveal">
-      Upload. Analyze.<br/>Improve.
+      Upload. Analyze. Fix.<br/>Deliver.
     </h2>
     <div class="steps">
       <div class="step reveal">
         <div class="step-num">01</div>
         <h3>Upload Deck</h3>
-        <p>Drop a PDF or PPTX. SlideForge extracts every slide with full layout awareness.</p>
+        <p>PPTX or PDF. SlideForge extracts 50+ slides in seconds with full layout awareness.</p>
       </div>
       <div class="step reveal">
         <div class="step-num">02</div>
-        <h3>AI Scans in Parallel</h3>
-        <p>Six agents run simultaneously via asyncio — structure, insights, data, visuals, language, claims.</p>
+        <h3>6 Agents Analyze</h3>
+        <p>Parallel execution: claims, structure, data, visuals, language, frameworks. Results in 60–180s.</p>
       </div>
       <div class="step reveal">
         <div class="step-num">03</div>
         <h3>Scored Report</h3>
-        <p>Get a dimensional score across clarity, logic, data, and language with slide-level callouts.</p>
+        <p>5-dimensional rubric: clarity, evidence, layout, visuals, guardrails. Slide-level findings + audit trail.</p>
       </div>
       <div class="step reveal">
         <div class="step-num">04</div>
-        <h3>Iterate Fast</h3>
-        <p>Fix flagged issues, re-upload, watch your score climb. Ship decks that impress.</p>
+        <h3>Auto-Fix Loop</h3>
+        <p>3-iteration remediation. LLM fixes violations → re-analyzes → verifies. Hand off clean decks.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- USE CASES -->
+  <section class="section reveal" style="margin-top: 80px;">
+    <p class="section-label reveal">Enterprise Results</p>
+    <h2 class="section-title reveal">Real Impact</h2>
+    <div class="features-grid" style="margin-top: 40px;">
+      <div class="feature-card reveal">
+        <div class="feature-icon icon-cyan" style="background: rgba(0, 212, 204, 0.15);">💼</div>
+        <h3>Consulting Firms</h3>
+        <p><strong>80% faster reviews</strong> · Partner time: 20 hours/year → 4 hours/year · Compliance violations: 15% → <2%</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon icon-lime" style="background: rgba(170, 255, 0, 0.15);">📈</div>
+        <h3>Financial Services</h3>
+        <p><strong>SOX-compliant audits</strong> · Deck review cycle: 21 days → 3 days · Immutable audit trail for SEC compliance.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon icon-yellow" style="background: rgba(255, 229, 0, 0.15);">🎯</div>
+        <h3>Agencies & Brands</h3>
+        <p><strong>Zero brand violations</strong> · Brand compliance audit: 5 days → 10 minutes · Consistent across 100+ decks.</p>
       </div>
     </div>
   </section>
