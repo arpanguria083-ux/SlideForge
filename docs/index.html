@@ -749,6 +749,106 @@
       </div>
     </div>
 
+    <!-- AGENT DEEP DIVE -->
+    <p class="section-label reveal" style="margin-top: 120px;">Agent Capabilities</p>
+    <h2 class="section-title reveal" style="margin-bottom: 80px;">Each Agent in Detail</h2>
+
+    <!-- Agent 1: OCR -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center; margin-bottom: 100px; padding-bottom: 80px; border-bottom: 1px solid var(--glass-border);">
+      <div class="reveal">
+        <h3 style="font-size: 1.8rem; font-weight: 700; margin-bottom: 20px;">OCR Extraction Agent</h3>
+        <p style="font-size: 0.95rem; color: rgba(255,255,255,0.65); line-height: 1.8; margin-bottom: 20px;">
+          <strong>Purpose:</strong> Extract all visual content from presentations with 99%+ accuracy.
+        </p>
+        <div style="background: rgba(0,212,204,0.1); border-left: 3px solid var(--cyan); padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+          <p style="font-size: 0.85rem; color: rgba(255,255,255,0.7); line-height: 1.7;">
+            <strong>✓ Multi-backend OCR:</strong> Surya, PaddleOCR, GotOCR2 fallback chains<br/>
+            <strong>✓ Layout-Aware Extraction:</strong> Preserves spatial relationships, bounding boxes, text ordering<br/>
+            <strong>✓ Table & Chart Detection:</strong> Recognizes and segments complex layouts<br/>
+            <strong>✓ Offline Capable:</strong> No cloud calls, runs fully local with GPU acceleration
+          </p>
+        </div>
+        <p style="font-size: 0.85rem; color: rgba(255,255,255,0.5);">
+          <em>Reduces manual transcription from 2 hours to 5 minutes per deck.</em>
+        </p>
+      </div>
+      <div class="reveal">
+        <img src="img/feature-ocr.png" alt="OCR Extraction — Multi-backend OCR setup with Surya, layout detection, and bounding boxes" style="width: 100%; border-radius: 12px; border: 1px solid var(--glass-border);" />
+      </div>
+    </div>
+
+    <!-- Agent 2-5: Unified Analysis View -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center; margin-bottom: 100px; padding-bottom: 80px; border-bottom: 1px solid var(--glass-border);">
+      <div class="reveal">
+        <img src="img/feature-analysis.png" alt="Analysis Results — Comprehensive agent findings: claims, structure, data validation, visuals, language" style="width: 100%; border-radius: 12px; border: 1px solid var(--glass-border);" />
+      </div>
+      <div class="reveal">
+        <h3 style="font-size: 1.8rem; font-weight: 700; margin-bottom: 20px;">Core Analysis Agents</h3>
+        <p style="font-size: 0.95rem; color: rgba(255,255,255,0.65); line-height: 1.8; margin-bottom: 20px;">
+          <strong>4 Parallel Agents Evaluate Every Slide:</strong>
+        </p>
+        <div style="background: rgba(170,255,0,0.1); border-left: 3px solid var(--lime); padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+          <p style="font-size: 0.85rem; color: rgba(255,255,255,0.7); line-height: 1.9;">
+            <strong>🎯 Insight Extractor:</strong> Validates claims, links evidence, flags unsupported assertions, scores logic chains<br/><br/>
+            <strong>🏗️ Structure Auditor:</strong> Analyzes narrative flow, MECE compliance, framework alignment (SWOT, Porter's, BCG, McKinsey 7S), headline quality<br/><br/>
+            <strong>📊 Data Lineage Agent:</strong> Matches charts to source data, verifies calculations, flags missing sources, detects inconsistencies<br/><br/>
+            <strong>🎨 Visual Analysis:</strong> Measures layout density, whitespace balance, visual hierarchy, cognitive load, brand compliance violations
+          </p>
+        </div>
+        <p style="font-size: 0.85rem; color: rgba(255,255,255,0.5);">
+          <em>All 4 agents run in parallel: complete analysis in 60–180 seconds.</em>
+        </p>
+      </div>
+    </div>
+
+    <!-- Agent 6: Language Quality -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center; margin-bottom: 100px; padding-bottom: 80px; border-bottom: 1px solid var(--glass-border);">
+      <div class="reveal">
+        <h3 style="font-size: 1.8rem; font-weight: 700; margin-bottom: 20px;">Language Quality Agent</h3>
+        <p style="font-size: 0.95rem; color: rgba(255,255,255,0.65); line-height: 1.8; margin-bottom: 20px;">
+          <strong>Purpose:</strong> Ensure professional, concise, grammatically correct prose across all slides.
+        </p>
+        <div style="background: rgba(255,229,0,0.1); border-left: 3px solid var(--yellow); padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+          <p style="font-size: 0.85rem; color: rgba(255,255,255,0.7); line-height: 1.7;">
+            <strong>✓ Grammar & Syntax:</strong> LanguageTool integration catches errors<br/>
+            <strong>✓ Business English Scoring:</strong> Tone, formality, conciseness metrics<br/>
+            <strong>✓ Redundancy Detection:</strong> Flags repetitive phrases, weak words<br/>
+            <strong>✓ Readability Index:</strong> Flesch-Kincaid grade level analysis
+          </p>
+        </div>
+        <p style="font-size: 0.85rem; color: rgba(255,255,255,0.5);">
+          <em>Ensures decks sound professional and compelling to executive audiences.</em>
+        </p>
+      </div>
+      <div class="reveal">
+        <img src="img/feature-analysis.png" alt="Language Quality Analysis — Grammar, tone, conciseness, and business English scoring" style="width: 100%; border-radius: 12px; border: 1px solid var(--glass-border);" />
+      </div>
+    </div>
+
+    <!-- Agent 7: Guardrails -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center; margin-bottom: 80px;">
+      <div class="reveal">
+        <img src="img/feature-guardrails.png" alt="Guardrails & Compliance — Custom rules, Ed25519 signing, audit trails, framework detection" style="width: 100%; border-radius: 12px; border: 1px solid var(--glass-border);" />
+      </div>
+      <div class="reveal">
+        <h3 style="font-size: 1.8rem; font-weight: 700; margin-bottom: 20px;">Guardrails & Auto-Remediation</h3>
+        <p style="font-size: 0.95rem; color: rgba(255,255,255,0.65); line-height: 1.8; margin-bottom: 20px;">
+          <strong>Purpose:</strong> Enforce compliance, detect violations, and auto-fix issues across presentations.
+        </p>
+        <div style="background: rgba(255,100,180,0.1); border-left: 3px solid #FF90C8; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+          <p style="font-size: 0.85rem; color: rgba(255,255,255,0.7); line-height: 1.7;">
+            <strong>✓ Custom Rule Engine:</strong> Define brand, compliance, governance rules<br/>
+            <strong>✓ Ed25519 Digital Signing:</strong> Cryptographic signatures for audit trails<br/>
+            <strong>✓ 3-Iteration Remediation:</strong> Fix → Re-analyze → Verify automatically<br/>
+            <strong>✓ SOX/FINRA Compliant:</strong> Immutable audit logs, role-based access
+          </p>
+        </div>
+        <p style="font-size: 0.85rem; color: rgba(255,255,255,0.5);">
+          <em>Eliminates manual remediation: automated fixes verified in seconds.</em>
+        </p>
+      </div>
+    </div>
+
     <!-- SCREENSHOTS GALLERY -->
     <p class="section-label reveal" style="margin-top: 120px;">Product in Action</p>
     <div class="gallery">
