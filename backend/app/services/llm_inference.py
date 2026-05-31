@@ -260,7 +260,8 @@ class TransformersLLM(BaseLLM):
 
                     if importlib.util.find_spec("bitsandbytes") is not None:
                         load_kwargs["load_in_4bit"] = True
-                        print("BitsAndBytes detected: Enabling 4-bit quantization")
+                        import logging
+                        logging.getLogger("slideforge.llm").info("BitsAndBytes detected: Enabling 4-bit quantization")
                 except Exception:
                     pass
 
@@ -550,11 +551,12 @@ class LLMFactory:
             try:
                 # Check for port 1234 (default LM Studio)
                 import socket
+                import logging
 
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.settimeout(0.5)
                     if s.connect_ex(("localhost", 1234)) == 0:
-                        print(
+                        logging.getLogger("slideforge.llm").info(
                             "LM Studio detected on port 1234, using it as primary LLM."
                         )
                         return LLMFactory.create(InferenceProvider.LM_STUDIO)

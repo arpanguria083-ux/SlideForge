@@ -1,0 +1,31 @@
+appId: com.slideforge.ai.full
+productName: SlideForge AI Full
+copyright: Copyright © 2026 SlideForge
+directories:
+  output: release/electron-full-zip
+  buildResources: buildResources
+files:
+  - dist/**
+  - '!dist/electron/**'
+  - dist-electron/**
+  - legal/**
+extraResources:
+  - from: ${env.SLIDEFORGE_BACKEND_DIST}
+    to: backend
+    filter:
+      - "**/*"
+      - "!**/*.dist-info/licenses/**"
+      - "!**/chromadb/utils/embedding_functions/**"
+  - from: ${env.SLIDEFORGE_MODEL_BUNDLE}
+    to: model-bundle
+# Windows code signing is controlled via environment variables:
+#   CSC_LINK          — file:///path/to/cert.pfx (or Base64-encoded in CI)
+#   CSC_KEY_PASSWORD  — PFX file password
+# Set these to enable Authenticode signing.
+# Without them, builds will be unsigned (no SmartScreen trust).
+win:
+  target:
+    - target: zip
+  artifactName: ${productName}-${version}-win-${arch}.zip
+mac:
+  target: dmg

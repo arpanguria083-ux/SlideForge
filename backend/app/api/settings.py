@@ -60,6 +60,20 @@ async def get_grammar_status():
     return await main_app.get_grammar_status()
 
 
+@router.get("/settings/runtime-assets")
+async def get_runtime_asset_status():
+    from app import main as main_app
+
+    return await main_app.get_runtime_asset_status()
+
+
+@router.get("/settings/ocr-variant")
+async def get_ocr_variant_state():
+    from app import main as main_app
+
+    return main_app.model_registry.get_ocr_variant_state()
+
+
 @router.get("/settings/local-llm/test")
 async def test_llm_connection():
     from app import main as main_app
@@ -72,6 +86,13 @@ async def get_llm_diagnostics():
     from app import main as main_app
 
     return await main_app.get_llm_diagnostics()
+
+
+@router.get("/diagnostics")
+async def get_diagnostics():
+    from app import main as main_app
+
+    return await main_app.get_diagnostics()
 
 
 @router.get("/settings/local-llm/models")

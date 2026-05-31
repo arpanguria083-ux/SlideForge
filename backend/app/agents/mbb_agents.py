@@ -8,8 +8,9 @@ from app.models.schemas import Annotation, GuardrailSchema
 from app.services.llm_inference import Message, inference_service, parse_json_response
 
 
-_llm_semaphore = asyncio.Semaphore(4)
-_vision_semaphore = asyncio.Semaphore(2)
+_remote_llm_semaphore = asyncio.Semaphore(4)
+_local_llm_semaphore = asyncio.Semaphore(2)  # Conservative for local LLM to prevent Ollama queue / timeout issues
+_vision_semaphore = asyncio.Semaphore(8)  # Increased from 2 to improve object detection concurrency
 
 # Removed duplicate _parse_json_response in favor of imported parse_json_response
 
@@ -28,7 +29,11 @@ async def _llm(prompt: str, system: str = "", max_tokens: int = 800) -> str:
         )
     )
 
-    async with _llm_semaphore:
+    provider = str(getattr(inference_service, "current_provider", "unknown"))
+    is_local = provider in ("lm_studio", "ollama", "transformers", "mlx")
+    llm_sem = _local_llm_semaphore if is_local else _remote_llm_semaphore
+
+    async with llm_sem:
         try:
             resp = await inference_service.llm.generate(
                 msgs,
@@ -635,11 +640,11 @@ class SlideContextSynthesizer:
                 contexts[idx] = {
                     "core_message": slide.get("title", "No title"),
                     "so_what": "Context synthesis unavailable because LLM is offline.",
-                    "audience_impact": "Review manually.",
+                    "audience_impact": "LLM service not available - manual review required",
                     "narrative_role": "evidence",
-                    "deck_fit": "",
-                    "executive_summary": "Synthesis unavailable.",
-                    "gaps": [],
+                    "deck_fit": "Analysis pending LLM availability",
+                    "executive_summary": "Synthesis unavailable - awaiting LLM service",
+                    "gaps": ["LLM service unavailable"],
                 }
                 continue
             prompt = f"""Synthesize this consulting slide for partner review.
@@ -649,17 +654,43 @@ FRAMEWORK: {json.dumps(framework_meta.get(idx, {}))[:1200]}
 SO_WHAT: {json.dumps(so_what_meta.get(idx, {}))[:1200]}
 BENCHMARK: {json.dumps(benchmark_meta.get(idx, {}))[:1200]}
 FINDINGS: {json.dumps(findings_by_slide.get(idx, [])[:8])}
-Return JSON keys: core_message, so_what, audience_impact, narrative_role(context|problem|diagnosis|recommendation|evidence|transition|appendix), deck_fit, executive_summary, gaps[]."""
-            payload = parse_json_response(await _llm(prompt, max_tokens=500))
+
+Return JSON with these keys:
+- core_message: Main message of slide
+- so_what: Why this matters (object with 'skipped', 'score', 'so_what_location')
+- audience_impact: How this affects the audience (string, non-empty required)
+- narrative_role: One of context|problem|diagnosis|recommendation|evidence|transition|appendix
+- deck_fit: How slide fits in presentation (string, non-empty required)
+- executive_summary: One-sentence summary (string, non-empty required)
+- gaps: Array of identified gaps or issues (list, can be empty)
+
+IMPORTANT: Populate audience_impact, deck_fit, and executive_summary with actual insights, not empty strings."""
+            llm_response = await _llm(prompt, max_tokens=500)
+            payload = parse_json_response(llm_response)
             if not isinstance(payload, dict):
                 payload = {}
+            
+            # Validate required fields - use sensible defaults if missing
+            core_msg = str(payload.get("core_message") or slide.get("title", "Untitled")).strip()
+            audience_impact = str(payload.get("audience_impact", "")).strip()
+            if not audience_impact:  # Fallback if LLM didn't generate
+                audience_impact = f"Impacts audience understanding of {core_msg}"
+            
+            deck_fit = str(payload.get("deck_fit", "")).strip()
+            if not deck_fit:  # Fallback if LLM didn't generate
+                deck_fit = "Provides supporting context within presentation structure"
+            
+            exec_summary = str(payload.get("executive_summary", "")).strip()
+            if not exec_summary:  # Fallback if LLM didn't generate
+                exec_summary = f"{core_msg}: Key point for executive audience"
+            
             contexts[idx] = {
-                "core_message": str(payload.get("core_message") or ""),
+                "core_message": core_msg,
                 "so_what": str(payload.get("so_what") or ""),
-                "audience_impact": str(payload.get("audience_impact") or ""),
+                "audience_impact": audience_impact,
                 "narrative_role": str(payload.get("narrative_role") or "evidence"),
-                "deck_fit": str(payload.get("deck_fit") or ""),
-                "executive_summary": str(payload.get("executive_summary") or ""),
+                "deck_fit": deck_fit,
+                "executive_summary": exec_summary,
                 "gaps": [str(i) for i in (payload.get("gaps") or []) if str(i).strip()],
             }
 

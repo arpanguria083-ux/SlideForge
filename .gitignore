@@ -34,3 +34,38 @@ docs/.~lock.*
 *.db
 backend/.env
 backend/data/
+
+# Code signing certificates (never commit real certificates)
+certs/
+*.pfx
+
+# Local packaging outputs and cache
+dist/electron/
+dist-electron/
+release/
+backend/build/SlideForge/
+backend/static/electron/
+node_modules
+
+# SlideForge custom ignore patterns
+backend/.venv.temp/
+backend/.model-cache/
+backend/temp-test-data/
+backend/static_build_*/
+backend/dist-package/
+backend/test_output.txt
+.temp_tts.py
+build_log.txt
+build_log_pdfplumber_fix.txt
+SlideForge-AI/
+hyperframes-demo/
+claude-code-video-toolkit/
+renders/
+slideforge screenshoot/
+video demo/
+nul
+*.bak
+*.bak.*
+ocr_manifest.json
+tsconfig.tsbuildinfo
+

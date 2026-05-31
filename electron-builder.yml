@@ -1,14 +1,24 @@
 appId: com.slideforge.ai
 productName: SlideForge AI
+copyright: Copyright © 2026 SlideForge
 directories:
-  output: dist/electron
+  output: release/electron
+  buildResources: buildResources
 files:
   - dist/**
-  - dist/electron/**
+  - '!dist/electron/**'
+  - dist-electron/**
   - legal/**
 extraResources:
-  - from: backend/dist/SlideForge
+  - from: backend/dist-package/SlideForge
     to: backend
+  - from: backend/model-bundle-ready
+    to: model-bundle
+# Windows code signing is controlled via environment variables:
+#   CSC_LINK          — file:///path/to/cert.pfx (or Base64-encoded in CI)
+#   CSC_KEY_PASSWORD  — PFX file password
+# Set these to enable Authenticode signing.
+# Without them, builds will be unsigned (no SmartScreen trust).
 win:
   target: nsis
 mac:
@@ -17,3 +27,8 @@ nsis:
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: SlideForge AI
+  warningsAsErrors: false
+  license: LICENSE

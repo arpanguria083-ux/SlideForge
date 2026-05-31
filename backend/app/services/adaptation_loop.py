@@ -84,6 +84,22 @@ class AdaptationDatabase:
             ON override_records(session_id)
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dimension_score_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                engagement_type TEXT NOT NULL,
+                dimension TEXT NOT NULL,
+                score REAL NOT NULL,
+                weight REAL NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dimension_score_lookup
+            ON dimension_score_history(engagement_type, dimension)
+        """)
+
         conn.commit()
         conn.close()
 
@@ -387,6 +403,85 @@ class AdaptationAgent:
 
         conn.commit()
         conn.close()
+
+    def track_dimension_scores(
+        self,
+        engagement_type: str,
+        dimension_scores: dict[str, float],
+        weights: dict[str, float],
+    ) -> None:
+        """Record dimension scores from a completed slide analysis for auto-tuning.
+
+        Stores per-dimension scores so compute_adjusted_weights() can detect
+        chronically underperforming dimensions and boost their rubric weight.
+        """
+        conn = sqlite3.connect(str(self.db.db_path))
+        cursor = conn.cursor()
+
+        now = utc_now_iso()
+        for dim, score in dimension_scores.items():
+            w = weights.get(dim, 0.0)
+            cursor.execute(
+                "INSERT INTO dimension_score_history (engagement_type, dimension, score, weight, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                (engagement_type, dim, score, w, now),
+            )
+
+        conn.commit()
+        conn.close()
+
+    def compute_adjusted_weights(
+        self,
+        engagement_type: str,
+        current_weights: dict[str, float],
+        lookback: int = 50,
+    ) -> dict[str, float]:
+        """Adjust rubric weights based on historical dimension score performance.
+
+        Dimensions that consistently score below threshold get their weight
+        increased so they contribute more to the overall score, making
+        low-performing dimensions harder to ignore.
+
+        Returns the adjusted weights dict (normalized to sum to 1.0).
+        """
+        conn = sqlite3.connect(str(self.db.db_path))
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT dimension, AVG(score) as avg_score, COUNT(*) as count
+            FROM dimension_score_history
+            WHERE engagement_type = ?
+            GROUP BY dimension
+            ORDER BY count DESC
+            LIMIT ?
+        """, (engagement_type, lookback * 2))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return current_weights
+
+        avg_scores = {row[0]: row[1] for row in rows}
+        threshold = 75.0
+
+        adjustments = {}
+        for dim in current_weights:
+            avg = avg_scores.get(dim)
+            if avg is not None and avg < threshold:
+                gap = (threshold - avg) / threshold
+                adjustments[dim] = 1.0 + gap * 0.5
+            else:
+                adjustments[dim] = 1.0
+
+        adjusted = {
+            dim: current_weights[dim] * adjustments.get(dim, 1.0)
+            for dim in current_weights
+        }
+        total = sum(adjusted.values())
+        if total > 0:
+            adjusted = {dim: v / total for dim, v in adjusted.items()}
+
+        return adjusted
 
     def get_approved_suggestions(self, engagement_type: str = None) -> list[dict]:
         conn = sqlite3.connect(str(self.db.db_path))

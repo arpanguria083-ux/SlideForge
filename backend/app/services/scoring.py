@@ -5,6 +5,7 @@ scoring logic independently testable.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -44,22 +45,14 @@ def build_visual_coverage(slide: dict, visual_meta: dict | None) -> dict:
     analyzed_table_like = sum(
         1
         for item in image_analysis
-        if (
-            item.get("type") == "table_vision"
-            or (
-                item.get("type") == "surya_block"
-                and "table" in str(item.get("label", "")).lower()
-            )
-        )
+        if item.get("type") == "table_vision"
     )
-    analyzed_regions = sum(
-        1 for item in image_analysis if item.get("type") == "surya_block"
-    )
+    analyzed_regions = len(image_analysis)
 
     expected_visuals = native_images + native_tables + native_charts
     fallback_expected = expected_visuals or len(detected_visuals)
     analyzed_visuals = analyzed_images + analyzed_charts + analyzed_table_like
-    effective_analyzed = max(analyzed_visuals, analyzed_regions)
+    effective_analyzed = analyzed_visuals
     coverage_ratio = (
         round(min(1.0, effective_analyzed / fallback_expected), 2)
         if fallback_expected > 0
@@ -124,10 +117,22 @@ def build_slide_consultant_score(
     visual_meta: dict | None,
 ) -> dict:
     """Compute the per-slide consultant score with 5 sub-dimensions."""
+    # Ensure review is a dict even if upstream returned a string or malformed payload
     review = (deep_analysis or {}).get("review", {})
-    alignment = ((review or {}).get("guardrail_alignment") or {}).get(
-        "status", "partial"
-    )
+    if not isinstance(review, dict):
+        try:
+            review = json.loads(review) if isinstance(review, str) else {}
+        except Exception:
+            review = {}
+
+    # guardrail_alignment may be a dict or a simple string; normalize to a status string
+    raw_alignment = (review.get("guardrail_alignment") or {})
+    if isinstance(raw_alignment, str):
+        alignment = raw_alignment
+    elif isinstance(raw_alignment, dict):
+        alignment = raw_alignment.get("status", "partial")
+    else:
+        alignment = "partial"
     visual_coverage = build_visual_coverage(slide, visual_meta)
 
     structure_categories = {
@@ -291,6 +296,11 @@ def build_slide_reliability(
     Final reliability = E[Beta(α, β)] = α / (α + β), scaled to 0-100.
     """
     review = (deep_analysis or {}).get("review", {}) or {}
+    if not isinstance(review, dict):
+        try:
+            review = json.loads(review) if isinstance(review, str) else {}
+        except Exception:
+            review = {}
     judge = (deep_analysis or {}).get("judge", {}) or {}
     agents = (deep_analysis or {}).get("agents", []) or []
     visual_coverage = build_visual_coverage(slide, visual_meta)
@@ -303,9 +313,13 @@ def build_slide_reliability(
     llm_understanding = str(review.get("llm_understanding", "") or "").strip().lower()
     layout_intelligence = str(review.get("layout_intelligence", "") or "").strip().lower()
     recommendations = review.get("detailed_recommendations", []) or []
-    alignment_status = (
-        (review.get("guardrail_alignment") or {}).get("status") or "partial"
-    ).lower()
+    raw_alignment = review.get("guardrail_alignment") or {}
+    if isinstance(raw_alignment, str):
+        alignment_status = str(raw_alignment or "partial").lower()
+    elif isinstance(raw_alignment, dict):
+        alignment_status = str(raw_alignment.get("status") or "partial").lower()
+    else:
+        alignment_status = "partial"
 
     # D1: LLM review summary (weight 2.5)
     if review and not llm_understanding.startswith("review summary unavailable"):

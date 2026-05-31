@@ -1,0 +1,84 @@
+SLIDEFORGE AI - END USER LICENSE AND INSTALLER AGREEMENT
+
+Last Updated: May 26, 2026
+
+PLEASE READ THIS END USER LICENSE AND INSTALLER AGREEMENT ("AGREEMENT") CAREFULLY BEFORE INITIATING, RUNNING, OR COMPLETING THE INSTALLATION OF SLIDEFORGE AI ("SOFTWARE") ON A WINDOWS OPERATING SYSTEM.
+
+BY LAUNCHING THE INSTALLER PACKAGE (INCLUDING NSIS-BASED SETUP EXECUTABLES, PORTABLE BUNDLES, OR MSIX PACKAGES), OR BY EXTRACTING BUNDLES OF THE INSTALLER, YOU ACKNOWLEDGE THAT YOU HAVE READ, UNDERSTOOD, AND EXPRESSLY AGREE TO BE BOUND BY THE TERMS OF THIS AGREEMENT.
+
+IF YOU DO NOT AGREE TO THESE TERMS, DO NOT RUN THE INSTALLER AND IMMEDIATELY DELETE ALL DOWNLOADED BUNDLES.
+
+========================================================================
+1. OPEN SOURCE STATUS AND LICENSING
+========================================================================
+1. Core Licensing: SlideForge AI is a free and open-source software application. The source code of SlideForge AI is licensed under the MIT License.
+2. Installer License: The Installer packaging scripts (e.g. NSIS scripts, electron-builder configurations) are provided under the same MIT License.
+3. No Fee: The Installer is provided free of charge. You are permitted to copy, distribute, modify, and run the Installer in accordance with the terms of the MIT License.
+4. Third-Party Binaries: To provide a ready-to-run experience on Windows without requiring manual environment configuration, this Installer bundles compiled binaries of third-party open-source components (including Node.js, Electron, Python, FastAPI, and scientific libraries). These third-party components are licensed under their respective open-source licenses (such as BSD, Apache 2.0, and Python Software Foundation licenses). For full third-party disclosures, refer to the "legal/OPEN_SOURCE_LICENSES.md" notice included in the installation directory.
+
+========================================================================
+2. SYSTEM MODIFICATIONS AND FILE PLACEMENTS
+========================================================================
+To install and operate correctly on Windows, the Installer and the resulting Software will perform the following actions and write files to the designated paths:
+
+1. Installation Directory:
+   * By default, the application is installed in the user-level directory:
+     %LocalAppData%\Programs\slideforge-ai\
+     (e.g., C:\Users\<Username>\AppData\Local\Programs\slideforge-ai)
+   * For machine-wide installations (if administrative privileges are provided), the application will be written to:
+     %ProgramFiles%\SlideForge AI\ or %ProgramFiles(x86)%\SlideForge AI\
+
+2. Application Data and Cache:
+   * SlideForge AI stores localized databases, cached PDF/PPTX representations, temporary vision-pipeline coordinates, and logs in:
+     %AppData%\slideforge-ai\
+     (e.g., C:\Users\<Username>\AppData\Roaming\slideforge-ai)
+   * Operational model cache, local Optical Character Recognition (OCR) neural network weights, and temporary local backends reside under:
+     %LocalAppData%\slideforge-ai-backend\ or within the user's home profile directory under ".cache" folders.
+
+3. Registry Modifications:
+   * The Installer will register standard Windows Uninstallation keys under:
+     HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\slideforge-ai
+   * This is required to support standard Windows Control Panel "Add/Remove Programs" functionality and clean uninstallation.
+   * The Installer does not write keys to HKLM (Local Machine) registry trees unless installed with explicit administrative overrides.
+
+4. Shortcuts:
+   * The Installer creates a Start Menu entry under "SlideForge AI" and optionally a Desktop shortcut.
+
+========================================================================
+3. LOCAL-FIRST PROCESSING AND RESOURCES
+========================================================================
+1. Offline Isolation: SlideForge AI is designed to operate locally. All slide analysis, document parsing, visual coordinate generation, and local text indexing are executed directly on your Windows endpoint using local CPUs, GPUs, and memory.
+2. System Resources: Performing local OCR and visual AI processing is highly resource-intensive. Depending on your Windows configuration, running these pipelines may lead to temporary spikes in CPU utilization, GPU memory allocation, and disk read/write cycles. You are responsible for ensuring that your Windows hardware meets the thermal and power requirements to handle heavy local machine learning operations safely.
+3. Network Connections: The Installer itself does not require an active internet connection to deploy the core Software. However, first-run activation of certain local AI features (such as high-precision OCR models) or standard third-party remote API models will require internet access to fetch weights or transmit API requests.
+
+========================================================================
+4. GDPR AND US PRIVACY COMPLIANCE
+========================================================================
+1. Local Data Storage: All processed presentation files, uploaded slide images, generated reports, scorecards, and local structural embeddings are stored entirely locally on your machine.
+2. No Remote Telemetry: SlideForge AI does not transmit system analytics, telemetry, user interaction profiles, or document contents to our developers or any centralized cloud servers.
+3. User Consent: By utilizing cloud LLM configurations (e.g. OpenAI, Claude, or custom remote endpoints), you acknowledge that your prompt data will be transmitted to those third-party providers. You are solely responsible for reviewing and consenting to the privacy policy of any remote provider you configure.
+4. GDPR Compliance: In accordance with the General Data Protection Regulation (GDPR), you retain full rights over your data. Because all databases are local, you can delete all your personal data, ingested slides, and histories at any time by simply uninstalling the application and purging the %AppData%\slideforge-ai\ directory.
+
+========================================================================
+5. EULA COMPLIANCE AND US LAW GOVERNANCE
+========================================================================
+1. Governance: This Agreement and your use of the Software is governed by and construed in accordance with the laws of the State of Delaware, United States, without regard to its conflict of law principles.
+2. No Redistribution: While SlideForge AI's source code is licensed under the MIT License, compiled installer packages featuring third-party brandings, custom icons, and commercial signatures may only be redistributed in their unaltered, official state.
+3. No Warranties: THE INSTALLER AND ALL PACKAGED COMPONENTS, SCRIPTS, BINARIES, AND ASSOCIATED SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+4. Limitation of Liability: IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, PACKAGERS, OR DISTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, LOSS OF DATA, SYSTEM INSTABILITY, BLUE SCREEN OF DEATH (BSOD) ERRORS, HARDWARE OVERHEATING, FILESYSTEM CORRUPTION, REGISTRY ERRORS, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE RUNNING, FAILURE, OR MISUSE OF THIS INSTALLER OR THE UNINSTALLATION UTILITY.
+
+========================================================================
+6. UNINSTALLATION
+========================================================================
+SlideForge AI can be fully uninstalled from your Windows system using standard Windows protocols:
+1. Open the Windows Settings menu.
+2. Navigate to Apps > Installed Apps (or Add/Remove Programs).
+3. Select "SlideForge AI Lite" and click Uninstall.
+4. The uninstaller will remove all compiled binaries and shortcuts.
+
+========================================================================
+7. CONTACT AND FOUNDER WEBSITE
+========================================================================
+SlideForge AI is an open-source project founded by Arpan Guria.
+* Founder Website / Connect: https://www.arpan-guria.in/
+* Official Repository: For technical support, installation troubleshooting, and to access the full source code, please visit the SlideForge repository.

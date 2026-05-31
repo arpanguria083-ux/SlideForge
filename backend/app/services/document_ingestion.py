@@ -9,6 +9,14 @@ from openpyxl import load_workbook
 
 from .model_registry import model_registry
 
+_logger_doc = None
+def _get_doc_logger():
+    global _logger_doc
+    if _logger_doc is None:
+        import logging
+        _logger_doc = logging.getLogger("slideforge.document_ingestion")
+    return _logger_doc
+
 
 @dataclass
 class TextRun:
@@ -139,12 +147,18 @@ class DocumentIngestionService:
                 scanned_indices = []  # pages where text < 10 chars
                 scanned_images = []  # rasterized PIL images for those pages
 
-                surya_recognition = None
+                # Check if OCR is needed for text-poor pages
+                need_ocr = False
                 try:
-                    surya_recognition = model_registry.get_surya_recognition()
-                except Exception as surya_err:
-                    print(f"Surya OCR unavailable; continuing without OCR: {surya_err}")
-                need_ocr = surya_recognition is not None
+                    from ..agents.parallel_analysis import _should_skip_ocr_for_text_rich_pdf
+                    if _should_skip_ocr_for_text_rich_pdf(file_path):
+                        _get_doc_logger().info("PDF %s has embedded text; skipping OCR processing", file_path)
+                        need_ocr = False
+                    else:
+                        need_ocr = True
+                except Exception as e:
+                    _get_doc_logger().warning("Failed to check OCR skip condition: %s (will attempt OCR)", e)
+                    need_ocr = True
 
                 for i, page in enumerate(pdf.pages):
                     page_w = float(page.width)
@@ -161,16 +175,26 @@ class DocumentIngestionService:
                     page_dims[i] = (page_w, page_h)
 
                     if need_ocr and len(text.strip()) < 10:
+                        img_rendered = None
                         try:
-                            scanned_images.append(
-                                page.to_image(resolution=150).original
-                            )
-                            scanned_indices.append(i)
-                        except Exception:
-                            scanned_indices.append(i)
-                            scanned_images.append(None)
+                            # 1. Try rendering with pypdfium2 (extremely fast, zero dependencies)
+                            import pypdfium2 as pdfium
+                            doc = pdfium.PdfDocument(file_path)
+                            page_pdfium = doc[i]
+                            # Render at 150 DPI (scale=2)
+                            bitmap = page_pdfium.render(scale=2)
+                            img_rendered = bitmap.to_pil()
+                        except Exception as e_pdfium:
+                            _get_doc_logger().warning("pdfium page render failed: %s", e_pdfium)
+                            try:
+                                img_rendered = page.to_image(resolution=150).original
+                            except Exception as e_plumber:
+                                _get_doc_logger().error("Both pdfium and pdfplumber page render failed: %s", e_plumber)
+                        
+                        scanned_images.append(img_rendered)
+                        scanned_indices.append(i)
 
-                # --- Pass 2: Batch OCR all scanned pages in one inference call ---
+                # --- Pass 2: OCR scanned pages using multi-backend OCR pipeline ---
                 ocr_texts: dict[int, str] = {}
                 ocr_line_boxes: dict[int, list[dict]] = {}
                 valid_imgs = [
@@ -180,91 +204,58 @@ class DocumentIngestionService:
                 ]
                 if valid_imgs:
                     try:
-                        layout_predictor = model_registry.get_surya_layout()
-                        imgs_only = [img for _, img in valid_imgs]
-                        _layout_results = layout_predictor(imgs_only)
-                        ocr_results = surya_recognition(
-                            imgs_only, [["en"]] * len(imgs_only)
-                        )
-                        for (page_idx, _), ocr_pred in zip(valid_imgs, ocr_results):
-                            ocr_lines = list(getattr(ocr_pred, "text_lines", []) or [])
-                            ocr_texts[page_idx] = "\n".join(
-                                (getattr(line, "text", "") or "").strip()
-                                for line in ocr_lines
-                                if (getattr(line, "text", "") or "").strip()
-                            )
-                            page_w, page_h = page_dims.get(page_idx, (0.0, 0.0))
-                            img_w, img_h = valid_imgs[
-                                [
-                                    idx
-                                    for idx, (p_idx, _) in enumerate(valid_imgs)
-                                    if p_idx == page_idx
-                                ][0]
-                            ][1].size
-                            line_boxes = []
-                            for line in ocr_lines[:300]:
-                                line_text = (getattr(line, "text", "") or "").strip()
-                                if not line_text:
-                                    continue
-                                bbox = getattr(line, "bbox", None)
-                                if bbox and len(bbox) >= 4:
-                                    x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
-                                else:
-                                    polygon = getattr(line, "polygon", None)
-                                    if not polygon:
-                                        continue
-                                    xs, ys = [], []
-                                    for pt in polygon:
-                                        if isinstance(pt, dict):
-                                            xs.append(float(pt.get("x", 0)))
-                                            ys.append(float(pt.get("y", 0)))
-                                        elif (
-                                            isinstance(pt, (list, tuple))
-                                            and len(pt) >= 2
-                                        ):
-                                            xs.append(float(pt[0]))
-                                            ys.append(float(pt[1]))
-                                    if not xs or not ys:
-                                        continue
-                                    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-
-                                if (
-                                    img_w <= 0
-                                    or img_h <= 0
-                                    or page_w <= 0
-                                    or page_h <= 0
-                                ):
-                                    continue
-                                x_in = (float(x0) / float(img_w)) * (page_w / 72.0)
-                                y_in = (float(y0) / float(img_h)) * (page_h / 72.0)
-                                w_in = ((float(x1) - float(x0)) / float(img_w)) * (
-                                    page_w / 72.0
-                                )
-                                h_in = ((float(y1) - float(y0)) / float(img_h)) * (
-                                    page_h / 72.0
-                                )
-                                if w_in <= 0.02 or h_in <= 0.02:
-                                    continue
-                                line_boxes.append(
-                                    {
-                                        "text": line_text,
-                                        "x": x_in,
-                                        "y": y_in,
-                                        "width": w_in,
-                                        "height": h_in,
-                                    }
-                                )
-                            if line_boxes:
-                                ocr_line_boxes[page_idx] = line_boxes
+                        from app.services.ocr_asset_manager import OcrAssetManager
+                        mgr = OcrAssetManager.get()
+                        backend_id = mgr.active_backend_id()
+                        from app.services.ocr_detectors import ocr_image
+                        
+                        for page_idx, pil_img in valid_imgs:
+                            try:
+                                ocr_result = ocr_image(pil_img, backend_id)
+                                page_w, page_h = page_dims.get(page_idx, (0.0, 0.0))
+                                img_w, img_h = pil_img.size
+                                
+                                if ocr_result and ocr_result.get("text"):
+                                    ocr_texts[page_idx] = ocr_result["text"]
+                                    
+                                    line_boxes = []
+                                    for line in (ocr_result.get("lines") or [])[:300]:
+                                        bbox = line.get("bbox", {})
+                                        x0 = bbox.get("x0", 0)
+                                        y0 = bbox.get("y0", 0)
+                                        x1 = bbox.get("x1", 1)
+                                        y1 = bbox.get("y1", 1)
+                                        line_text = (line.get("text") or "").strip()
+                                        if not line_text:
+                                            continue
+                                        if img_w <= 0 or img_h <= 0 or page_w <= 0 or page_h <= 0:
+                                            continue
+                                        x_in = (float(x0) / float(img_w)) * (page_w / 72.0)
+                                        y_in = (float(y0) / float(img_h)) * (page_h / 72.0)
+                                        w_in = ((float(x1) - float(x0)) / float(img_w)) * (page_w / 72.0)
+                                        h_in = ((float(y1) - float(y0)) / float(img_h)) * (page_h / 72.0)
+                                        if w_in <= 0.02 or h_in <= 0.02:
+                                            continue
+                                        line_boxes.append({
+                                            "text": line_text,
+                                            "x": x_in,
+                                            "y": y_in,
+                                            "width": w_in,
+                                            "height": h_in,
+                                        })
+                                    if line_boxes:
+                                        ocr_line_boxes[page_idx] = line_boxes
+                            except Exception as page_ocr_err:
+                                _get_doc_logger().error("OCR failed for page %d: %s", page_idx, page_ocr_err)
                     except Exception as ocr_err:
-                        print(f"Surya batch OCR failed: {ocr_err}")
+                        _get_doc_logger().error("Multi-backend OCR pipeline failed: %s", ocr_err)
 
                 # --- Pass 3: Build slides with resolved text ---
                 for i, (slide, page, page_w, page_h, text) in enumerate(slides):
                     if i in ocr_texts and len(ocr_texts[i]) > len(text):
                         text = ocr_texts[i]
                         slide.title += " (OCR)"
-                        slide.ocr_backend = "surya"
+                        slide.ocr_backend = "ocr"
 
                     line_boxes = ocr_line_boxes.get(i, [])
                     if line_boxes:
@@ -306,7 +297,7 @@ class DocumentIngestionService:
                             ]
                         )
 
-                        # Convert bbox from PDF points to percentage-based coords
+                        # Convert bbox from PDF points to standard inches (72 points = 1 inch)
                         bbox = tbl.bbox  # (x0, top, x1, bottom) in PDF points
                         slide.tables.append(
                             TableData(
@@ -315,14 +306,10 @@ class DocumentIngestionService:
                                 columns=cols_count,
                                 title=f"Table {j + 1}",
                                 text=table_text,
-                                x=(bbox[0] / page_w) * 100 if page_w > 0 else 0,
-                                y=(bbox[1] / page_h) * 100 if page_h > 0 else 0,
-                                width=((bbox[2] - bbox[0]) / page_w) * 100
-                                if page_w > 0
-                                else 0,
-                                height=((bbox[3] - bbox[1]) / page_h) * 100
-                                if page_h > 0
-                                else 0,
+                                x=bbox[0] / 72.0,
+                                y=bbox[1] / 72.0,
+                                width=(bbox[2] - bbox[0]) / 72.0,
+                                height=(bbox[3] - bbox[1]) / 72.0,
                             )
                         )
 
@@ -338,19 +325,15 @@ class DocumentIngestionService:
                             slide.images.append(
                                 ImageElement(
                                     id=f"img_{i}_{j}",
-                                    x=(img_x0 / page_w) * 100 if page_w > 0 else 0,
-                                    y=(img_top / page_h) * 100 if page_h > 0 else 0,
-                                    width=((img_x1 - img_x0) / page_w) * 100
-                                    if page_w > 0
-                                    else 0,
-                                    height=((img_bottom - img_top) / page_h) * 100
-                                    if page_h > 0
-                                    else 0,
-                                    image_data=None,  # Raw bytes extraction complex; rely on Surya vision
+                                    x=img_x0 / 72.0,
+                                    y=img_top / 72.0,
+                                    width=(img_x1 - img_x0) / 72.0,
+                                    height=(img_bottom - img_top) / 72.0,
+                                    image_data=None,  # Raw bytes extraction complex; rely on OCR backend vision
                                 )
                             )
                     except Exception as img_err:
-                        print(f"PDF image extraction error on page {i}: {img_err}")
+                        _get_doc_logger().error("PDF image extraction error on page %d: %s", i, img_err)
 
                     deck.slides.append(slide)
             return deck
@@ -360,9 +343,9 @@ class DocumentIngestionService:
                 raise Exception(
                     "The uploaded PDF is encrypted. Please provide an unlocked PDF."
                 )
-            import traceback
+            import logging
 
-            traceback.print_exc()
+            logging.getLogger("slideforge.document_ingestion").error("Failed to ingest PDF: %s", error_str)
             raise Exception(f"Failed to ingest PDF: {error_str}")
 
     def _extract_slide_content(
@@ -607,7 +590,7 @@ class DocumentIngestionService:
                 finally:
                     pythoncom.CoUninitialize()
             except Exception as e:
-                print(f"COM Rendering failed, falling back to placeholder: {e}")
+                _get_doc_logger().warning("COM Rendering failed, falling back to placeholder: %s", e)
 
         if rendered_via_com:
             return output_paths
@@ -670,7 +653,7 @@ class DocumentIngestionService:
                 img.save(slide_image_path)
                 output_paths.append(slide_image_path)
             except Exception as e:
-                print(f"Error rendering slide {idx}: {e}")
+                _get_doc_logger().error("Error rendering slide %d: %s", idx, e)
                 # Create a fallback blank image
                 img = Image.new("RGB", (800, 600), "white")
                 img.save(slide_image_path)
@@ -681,12 +664,30 @@ class DocumentIngestionService:
     async def convert_pdf_to_images(
         self, file_path: str, output_dir: str, dpi: int = 150
     ) -> list[str]:
-        import pdfplumber
-
         output_paths = []
         os.makedirs(output_dir, exist_ok=True)
 
+        # 1. Try with pypdfium2 (extremely fast, zero dependencies, pure python binding for Google PDFium)
         try:
+            import pypdfium2 as pdfium
+            _get_doc_logger().info("Converting PDF to images using pypdfium2...")
+            doc = pdfium.PdfDocument(file_path)
+            # Map DPI to rendering scale. 72 DPI is scale=1. 150 DPI is scale=2
+            scale = max(1, int(dpi / 72))
+            for i in range(len(doc)):
+                image_path = os.path.join(output_dir, f"slide_{i}.png")
+                page = doc[i]
+                bitmap = page.render(scale=scale)
+                pil_img = bitmap.to_pil()
+                pil_img.save(image_path, format="PNG")
+                output_paths.append(image_path)
+            return output_paths
+        except Exception as e:
+            _get_doc_logger().warning("pypdfium2 conversion failed, falling back to pdfplumber: %s", e)
+
+        # 2. Fallback to pdfplumber
+        try:
+            import pdfplumber
             with pdfplumber.open(file_path) as pdf:
                 for i, page in enumerate(pdf.pages):
                     image_path = os.path.join(output_dir, f"slide_{i}.png")
@@ -694,5 +695,5 @@ class DocumentIngestionService:
                     output_paths.append(image_path)
             return output_paths
         except Exception as e:
-            print(f"Error converting PDF to images: {e}")
+            _get_doc_logger().error("Error converting PDF to images: %s", e)
             return []

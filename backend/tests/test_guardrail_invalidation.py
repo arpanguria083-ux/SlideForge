@@ -1,5 +1,6 @@
 import importlib
 import json
+import time
 
 import pytest
 
@@ -27,6 +28,7 @@ def main_module(tmp_path, monkeypatch):
 
 
 def _seed_session(mod, session_id: str):
+    now_ts = time.time()
     mod.active_sessions[session_id] = {
         "client_namespace": "acme",
         "namespace_key": "acme",
@@ -59,8 +61,8 @@ def _seed_session(mod, session_id: str):
         "agent_metadata": {"Visual Analysis Agent": {"slides_analysis": {}}},
         "history_restored": True,
         "status": "analyzed",
-        "created_at_ts": 0,
-        "last_access_ts": 0,
+        "created_at_ts": now_ts,
+        "last_access_ts": now_ts,
     }
     mod.session_store.save(session_id, mod.active_sessions[session_id])
 
@@ -115,3 +117,73 @@ async def test_activate_template_invalidates_cached_analysis(main_module):
     persisted = mod.session_store.load(session_id)
     assert persisted is not None
     assert persisted.get("status") == "parsed"
+
+
+@pytest.mark.asyncio
+async def test_upload_source_invalidates_cached_analysis(main_module, tmp_path):
+    mod = main_module
+    session_id = "session-source"
+    _seed_session(mod, session_id)
+
+    class _ChromaStub:
+        def add_documents(self, namespace, documents, ids, metadatas):
+            self.last_call = {
+                "namespace": namespace,
+                "documents": documents,
+                "ids": ids,
+                "metadatas": metadatas,
+            }
+
+    mod.chroma_manager = _ChromaStub()
+
+    from fastapi import UploadFile
+
+    source_path = tmp_path / "source.txt"
+    source_path.write_text("Fact one\nFact two", encoding="utf-8")
+    with source_path.open("rb") as handle:
+        upload = UploadFile(filename="source.txt", file=handle)
+        result = await mod.upload_source_document(session_id, upload)
+
+    assert result["status"] == "indexed"
+    session = mod.active_sessions[session_id]
+    assert session.get("status") == "parsed"
+    assert session.get("history_restored") is False
+    assert session.get("scorecard") is None
+    assert session.get("source_namespace") == f"session_{session_id}"
+    persisted = mod.session_store.load(session_id)
+    assert persisted is not None
+    assert persisted.get("status") == "parsed"
+    assert persisted.get("scorecard") is None
+
+
+@pytest.mark.asyncio
+async def test_upload_excel_invalidates_cached_analysis(main_module, tmp_path):
+    mod = main_module
+    session_id = "session-excel"
+    _seed_session(mod, session_id)
+
+    from fastapi import UploadFile
+    from openpyxl import Workbook
+
+    excel_path = tmp_path / "lineage.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(["Metric", "Value"])
+    ws.append(["Revenue", 42])
+    wb.save(excel_path)
+
+    with excel_path.open("rb") as handle:
+        upload = UploadFile(filename="lineage.xlsx", file=handle)
+        result = await mod.upload_excel_for_data_lineage(session_id, upload)
+
+    assert result["status"] == "loaded"
+    session = mod.active_sessions[session_id]
+    assert session.get("status") == "parsed"
+    assert session.get("history_restored") is False
+    assert session.get("scorecard") is None
+    assert session.get("excel_data") is not None
+    persisted = mod.session_store.load(session_id)
+    assert persisted is not None
+    assert persisted.get("status") == "parsed"
+    assert persisted.get("scorecard") is None

@@ -74,19 +74,57 @@ class SQLiteSessionStore:
                     ),
                 )
 
-    def load(self, session_id: str) -> Optional[dict]:
+    def load(self, session_id: str, ttl_seconds: Optional[int] = None) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT state_json FROM sessions WHERE session_id = ?", (session_id,)
+                "SELECT state_json, last_accessed FROM sessions WHERE session_id = ?",
+                (session_id,),
             ).fetchone()
             if not row:
                 return None
+            if ttl_seconds is not None:
+                last_accessed = float(row["last_accessed"] or 0)
+                if time.time() - last_accessed > ttl_seconds:
+                    return None
             return json.loads(row["state_json"])
+
+    def touch(
+        self, session_id: str, last_accessed: Optional[float] = None, status: Optional[str] = None
+    ) -> None:
+        ts = float(last_accessed or time.time())
+        with self._lock:
+            with self._connect() as conn:
+                if status is None:
+                    conn.execute(
+                        "UPDATE sessions SET last_accessed = ? WHERE session_id = ?",
+                        (ts, session_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE sessions SET last_accessed = ?, status = ? WHERE session_id = ?",
+                        (ts, status, session_id),
+                    )
 
     def delete(self, session_id: str) -> None:
         with self._lock:
             with self._connect() as conn:
                 conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    def delete_expired(self, ttl_seconds: int) -> list[str]:
+        cutoff = time.time() - ttl_seconds
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT session_id FROM sessions WHERE last_accessed < ?",
+                    (cutoff,),
+                ).fetchall()
+                expired_ids = [str(row["session_id"]) for row in rows]
+                if expired_ids:
+                    conn.execute(
+                        "DELETE FROM sessions WHERE last_accessed < ?",
+                        (cutoff,),
+                    )
+        return expired_ids
 
     def list_active(self, ttl_seconds: int) -> dict[str, dict]:
         cutoff = time.time() - ttl_seconds
@@ -108,7 +146,7 @@ class SQLiteSessionStore:
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(
-                    "SELECT session_id, state_json FROM sessions WHERE status IN ('parsing','analyzing') AND last_accessed < ?",
+                    "SELECT session_id, state_json FROM sessions WHERE status IN ('uploading','parsing','analyzing','revising') AND last_accessed < ?",
                     (cutoff,),
                 ).fetchall()
                 updated = 0

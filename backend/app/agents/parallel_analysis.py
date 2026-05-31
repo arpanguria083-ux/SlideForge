@@ -19,9 +19,16 @@ from ..models.schemas import (
 from ..services.llm_inference import inference_service, Message, parse_json_response
 
 
-MAX_CONCURRENT_LLM = int(os.environ.get("MAX_CONCURRENT_LLM", "4"))
-_llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
-_vision_semaphore = asyncio.Semaphore(2)
+MAX_CONCURRENT_LLM = int(os.environ.get("MAX_CONCURRENT_LLM", "8"))
+_remote_llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+_local_llm_semaphore = asyncio.Semaphore(2)  # Conservative for local LLM to prevent Ollama queue / timeout issues
+
+MAX_CONCURRENT_VISION = int(os.environ.get("MAX_CONCURRENT_VISION", "8"))
+_remote_vision_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VISION)
+_local_vision_semaphore = asyncio.Semaphore(1)  # local vision is highly CPU/VRAM bound, keep it strictly sequential
+
+_cpu_ocr_semaphore = asyncio.Semaphore(1)  # CPU layout/OCR detection (fully sequential to prevent CPU thrashing)
+_gpu_ocr_semaphore = asyncio.Semaphore(2)  # GPU accelerated layout/OCR (slightly higher concurrency)
 
 
 def _hash_llm_cache_key(parts: list[str]) -> str:
@@ -39,7 +46,7 @@ def _llm_cache_db_path() -> Path:
     return cache_dir / "llm_cache.sqlite"
 
 
-def _llm_cache_get(key: str, ttl_seconds: int = 14 * 24 * 3600) -> str | None:
+def _llm_cache_get(key: str, ttl_seconds: int = 24 * 3600) -> str | None:  # Reduced from 14 days to 1 day to prevent stale analysis
     import sqlite3
     import time
 
@@ -80,6 +87,109 @@ def _llm_cache_set(key: str, response_text: str) -> None:
         conn.commit()
 
 
+def _vision_cache_db_path() -> Path:
+    """Get the path to the vision result cache database."""
+    cache_dir = Path(
+        os.getenv("VISION_CACHE_DIR", str(Path.home() / ".slideforge" / "data"))
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "vision_cache.sqlite"
+
+
+def _should_skip_ocr_for_text_rich_pdf(pdf_path: str, sample_pages: int = 5) -> bool:
+    """
+    Check if PDF has sufficient embedded text to skip OCR processing.
+    Skipping OCR on text-rich PDFs saves ~19-23 seconds per page.
+    """
+    try:
+        import pdfplumber
+        from pathlib import Path
+        
+        if not Path(pdf_path).exists():
+            return False
+            
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            sample_size = min(sample_pages, total_pages)
+            
+            # Sample pages to check for text
+            text_count = 0
+            for i in range(0, total_pages, max(1, total_pages // sample_size)):
+                page = pdf.pages[i]
+                page_text = page.extract_text() or ""
+                text_count += len(page_text.strip())
+            
+            # If we found substantial text in samples, skip OCR
+            # Threshold: 1000+ chars in sample pages suggests text-rich PDF
+            should_skip = text_count > 1000
+            if should_skip:
+                import logging
+                logger = logging.getLogger("slideforge.agents")
+                logger.info(f"Skipping OCR for {pdf_path}: found {text_count} chars in {sample_size} sample pages")
+            return should_skip
+    except Exception as e:
+        import logging
+        logger = logging.getLogger("slideforge.agents")
+        logger.warning(f"Failed to check if PDF should skip OCR: {e}")
+        return False
+
+
+def _vision_cache_get(image_digest: str, ttl_seconds: int = 7 * 24 * 3600) -> str | None:
+    """Get cached vision analysis result for an image (7-day TTL)."""
+    import sqlite3
+    import time
+
+    try:
+        db_path = _vision_cache_db_path()
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vision_cache (image_digest TEXT PRIMARY KEY, result_json TEXT NOT NULL, created_at REAL NOT NULL)"
+            )
+            row = conn.execute(
+                "SELECT result_json, created_at FROM vision_cache WHERE image_digest = ?",
+                (image_digest,),
+            ).fetchone()
+            if not row:
+                return None
+            result_json, created_at = row
+            if (time.time() - float(created_at)) > ttl_seconds:
+                conn.execute("DELETE FROM vision_cache WHERE image_digest = ?", (image_digest,))
+                conn.commit()
+                return None
+            return str(result_json)
+    except Exception as e:
+        logger.warning(f"Vision cache read failed: {e}")
+        return None
+
+
+def _vision_cache_set(image_digest: str, result_json: str) -> None:
+    """Store vision analysis result in cache."""
+    import sqlite3
+    import time
+
+    try:
+        db_path = _vision_cache_db_path()
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vision_cache (image_digest TEXT PRIMARY KEY, result_json TEXT NOT NULL, created_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO vision_cache(image_digest, result_json, created_at) VALUES (?, ?, ?)",
+                (image_digest, result_json, time.time()),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Vision cache write failed: {e}")
+
+
+def _image_digest(image_bytes: bytes) -> str:
+    """Compute hash of image bytes for caching."""
+    import hashlib
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
 class AnalysisState(TypedDict):
     deck_path: str
     slides_data: list
@@ -105,15 +215,6 @@ from .mbb_agents import (
     CompetitiveBenchmarkAgent,
     SlideContextSynthesizer,
 )
-
-
-def _surya_available() -> bool:
-    try:
-        import importlib.util
-
-        return importlib.util.find_spec("surya.layout") is not None
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +268,10 @@ async def _llm(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
     logger.debug("LLM cache miss")
 
     last_error = None
-    async with _llm_semaphore:
+    is_local = provider in ("lm_studio", "ollama", "transformers", "mlx")
+    llm_sem = _local_llm_semaphore if is_local else _remote_llm_semaphore
+
+    async with llm_sem:
         for attempt in range(3):
             try:
                 resp = await inference_service.llm.generate(
@@ -763,18 +867,17 @@ class DataLineageAgent:
 
 
 # ---------------------------------------------------------------------------
-# Visual Analysis Agent — Surya layout detection + python-pptx fallback
+# Visual Analysis Agent — OCR backend layout detection + python-pptx fallback
 # ---------------------------------------------------------------------------
 
 
 class VisualAnalysisAgent:
     """
-    Uses Surya layout model when available for real bounding-box element detection.
-    Falls back to python-pptx coordinate analysis when Surya is not installed.
+    Uses OCR backend layout models when available for bounding-box element detection.
+    Falls back to python-pptx coordinate analysis when detection models are not available.
 
-    Surya detects 15+ block types: text, section-header, caption, footnote,
+    Detects block types: text, section-header, caption, footnote,
     table, figure, image, page-header, page-footer, etc.
-    Reading order predictor gives the correct visual reading sequence.
     """
 
     async def run(self, slides_data: list, guardrail: GuardrailSchema) -> AgentResult:
@@ -783,14 +886,21 @@ class VisualAnalysisAgent:
         annotations = []
         slide_metadata = {}
 
-        # Check Surya availability/model readiness once, not inside every loop iteration.
-        surya_layout_predictor = None
-        if _surya_available():
-            try:
-                surya_layout_predictor = model_registry.get_surya_layout()
-            except Exception:
-                surya_layout_predictor = None
-        surya_ok = surya_layout_predictor is not None
+        # Get device detection and recommended OCR backend
+        try:
+            from ..services.device_detector import detect as get_device_config
+            device_config = get_device_config()
+            recommended_backend = device_config.recommended_backend
+            supported_backends = device_config.all_supported_backends or ["doctr", "got_ocr2", "paddleocr"]
+            logger.info(
+                f"Device config: {device_config.platform} {device_config.python_arch}, "
+                f"RAM: {device_config.ram_total_mb}MB, CUDA: {device_config.cuda_available}, "
+                f"Recommended: {recommended_backend}"
+            )
+        except Exception as e:
+            logger.warning(f"Could not get device config: {e}")
+            recommended_backend = "doctr"
+            supported_backends = ["doctr", "got_ocr2", "paddleocr"]
 
         vision_backend = "unknown"
         try:
@@ -806,20 +916,52 @@ class VisualAnalysisAgent:
 
         async def _process_slide(slide: dict):
             slide_idx = slide.get("index", 0)
-            result_data = {"visuals": [], "density": "Medium", "image_analysis": []}
+            result_data = {"visuals": [], "density": "Medium", "image_analysis": [], "detection_method": "unknown"}
 
-            if surya_ok:
-                surya_anns, visuals, density_val = await self._analyze_with_surya(
+            # Try detection methods in priority order:
+            # 1. OCR backends (recommended first, then others)
+            # 2. OpenCV fallback
+            # 3. PPTX coordinate fallback
+
+            anns = None
+            visuals = []
+            density_val = "Medium"
+            detection_used = None
+
+            # Try OCR backends first
+            use_gpu = False
+            try:
+                use_gpu = bool(device_config.cuda_available or device_config.mps_available)
+            except Exception:
+                pass
+            ocr_sem = _gpu_ocr_semaphore if use_gpu else _cpu_ocr_semaphore
+            async with ocr_sem:
+                anns, visuals, detection_used = await self._analyze_with_ocr_backends(
                     slide_idx,
                     slide,
                     guardrail,
-                    layout_predictor=surya_layout_predictor,
+                    recommended_backend,
+                    supported_backends,
                 )
-                result_data["visuals"] = visuals
-                result_data["density"] = density_val
-            else:
-                surya_anns = self._analyze_with_pptx_coords(slide_idx, slide, guardrail)
-                result_data["visuals"] = self._get_visual_blocks_from_pptx(slide)
+
+            # Fall back to OpenCV if OCR backends didn't work
+            if anns is None:
+                try:
+                    anns, visuals = await self._analyze_with_opencv(slide_idx, slide, guardrail)
+                    if anns is not None:
+                        detection_used = "opencv"
+                except Exception as e:
+                    logger.warning(f"OpenCV detection failed for slide {slide_idx}: {e}")
+
+            # Fall back to PPTX coordinates if nothing worked
+            if anns is None:
+                anns = self._analyze_with_pptx_coords(slide_idx, slide, guardrail)
+                visuals = self._get_visual_blocks_from_pptx(slide)
+                detection_used = "pptx"
+
+            result_data["visuals"] = visuals
+            result_data["density"] = density_val
+            result_data["detection_method"] = detection_used or "unknown"
 
             font_issues = self._check_font_consistency(slide_idx, slide)
             image_anns, image_analysis = await self._analyze_images_with_vision(
@@ -827,7 +969,7 @@ class VisualAnalysisAgent:
             )
             result_data["image_analysis"] = image_analysis
 
-            return slide_idx, surya_anns + font_issues + image_anns, result_data
+            return slide_idx, anns + font_issues + image_anns, result_data
 
         slide_results = await asyncio.gather(
             *[_process_slide(slide) for slide in slides_data],
@@ -845,14 +987,20 @@ class VisualAnalysisAgent:
         warn = sum(1 for a in annotations if a.severity == "warning")
         suggest = sum(1 for a in annotations if a.severity == "suggestion")
         score = _exponential_decay_score(hard, warn, suggest)
+        
+        # Determine which detection method was used most
+        detection_methods = [m.get("detection_method", "unknown") for m in slide_metadata.values()]
+        detection_method = max(set(detection_methods), key=detection_methods.count) if detection_methods else "unknown"
+        
         return AgentResult(
             agent_name="Visual Analysis Agent",
             findings=annotations,
             score=score,
             metadata={
                 "slides_checked": len(slides_data),
-                "surya_used": surya_ok,
-                "surya_model_ready": surya_ok,
+                "detection_method": detection_method,
+                "recommended_ocr_backend": recommended_backend,
+                "supported_ocr_backends": supported_backends,
                 "vision_backend": vision_backend,
                 "slides_analysis": slide_metadata,
             },
@@ -861,183 +1009,448 @@ class VisualAnalysisAgent:
     def _get_visual_blocks_from_pptx(self, slide: dict) -> list[dict]:
         """Convert extracted PPTX shapes to BoundingBox format."""
         visuals = []
+        slide_w = float(slide.get("width") or 10.0)
+        slide_h = float(slide.get("height") or 7.5)
+        if slide_w <= 0:
+            slide_w = 10.0
+        if slide_h <= 0:
+            slide_h = 7.5
+
+        # Helper to convert absolute inch to percent
+        def to_pct_box(x, y, w, h):
+            return {
+                "left": (x / slide_w) * 100.0,
+                "top": (y / slide_h) * 100.0,
+                "width": (w / slide_w) * 100.0,
+                "height": (h / slide_h) * 100.0,
+                "coord_unit": "percent"
+            }
+
         # Add charts
         for chart in slide.get("charts", []):
-            visuals.append(
-                {
-                    "top": chart.get("y", 0),
-                    "left": chart.get("x", 0),
-                    "width": chart.get("width", 0),
-                    "height": chart.get("height", 0),
-                    "coord_unit": chart.get("coord_unit", "percent"),
-                    "label": f"Chart: {chart.get('title', 'Untitled')}",
-                    "visual_key": chart.get("id", ""),
-                }
-            )
+            pct = to_pct_box(chart.get("x", 0), chart.get("y", 0), chart.get("width", 0), chart.get("height", 0))
+            pct.update({
+                "label": f"Chart: {chart.get('title', 'Untitled')}",
+                "visual_key": chart.get("id", ""),
+            })
+            visuals.append(pct)
+
         # Add tables
         for table in slide.get("tables", []):
-            visuals.append(
-                {
-                    "top": table.get("y", 0),
-                    "left": table.get("x", 0),
-                    "width": table.get("width", 0),
-                    "height": table.get("height", 0),
-                    "coord_unit": table.get("coord_unit", "percent"),
-                    "label": f"Table: {table.get('title', 'Untitled')}",
-                    "visual_key": table.get("id", ""),
-                }
-            )
+            pct = to_pct_box(table.get("x", 0), table.get("y", 0), table.get("width", 0), table.get("height", 0))
+            pct.update({
+                "label": f"Table: {table.get('title', 'Untitled')}",
+                "visual_key": table.get("id", ""),
+            })
+            visuals.append(pct)
+
+        # Add images
+        for img in slide.get("images", []):
+            pct = to_pct_box(img.get("x", 0), img.get("y", 0), img.get("width", 0), img.get("height", 0))
+            pct.update({
+                "label": "Image",
+                "visual_key": img.get("id", ""),
+            })
+            visuals.append(pct)
+
+        # Add text boxes
+        for tb in slide.get("text_boxes", []):
+            pct = to_pct_box(tb.get("x", 0), tb.get("y", 0), tb.get("width", 0), tb.get("height", 0))
+            pct.update({
+                "label": "Text",
+                "visual_key": tb.get("id", ""),
+                "text": tb.get("text", "")
+            })
+            visuals.append(pct)
+
         return visuals
 
-    async def _analyze_with_surya(
+
+def _classify_and_merge_layout(blocks: list[dict], page_w: int, page_h: int) -> list[dict]:
+    """
+    Groups individual bounding boxes into semantic blocks, and classifies them
+    as Page-Header, Page-Footer, Diagram, Caption, or Text.
+    """
+    if not blocks:
+        return []
+
+    # 1. Standardize bboxes to normalized [x1, y1, x2, y2]
+    raw_elements = []
+    for b in blocks:
+        bbox = b.get("bbox", [0.0, 0.0, 1.0, 1.0])
+        x1, y1, x2, y2 = bbox
+        
+        # Normalize if coordinates are pixels
+        if x1 > 1.0 or y1 > 1.0 or x2 > 1.0 or y2 > 1.0:
+            if page_w > 0 and page_h > 0:
+                x1 = x1 / page_w
+                y1 = y1 / page_h
+                x2 = x2 / page_w
+                y2 = y2 / page_h
+            else:
+                x1, y1, x2, y2 = min(1.0, x1/1000.0), min(1.0, y1/1000.0), min(1.0, x2/1000.0), min(1.0, y2/1000.0)
+
+        x1, y1, x2, y2 = max(0.0, min(1.0, x1)), max(0.0, min(1.0, y1)), max(0.0, min(1.0, x2)), max(0.0, min(1.0, y2))
+        
+        raw_elements.append({
+            "bbox": [x1, y1, x2, y2],
+            "label": b.get("label", "text").lower(),
+            "confidence": b.get("confidence", 0.7),
+            "text": b.get("text", "").strip()
+        })
+
+    # 2. Group close vertical text blocks (columns/paragraphs)
+    grouped_elements = []
+    used_indices = set()
+
+    for idx, elem in enumerate(raw_elements):
+        if idx in used_indices:
+            continue
+            
+        group = [elem]
+        used_indices.add(idx)
+        
+        if elem["label"] == "text":
+            merged = True
+            while merged:
+                merged = False
+                for other_idx, other_elem in enumerate(raw_elements):
+                    if other_idx in used_indices or other_elem["label"] != "text":
+                        continue
+                    
+                    gx1 = min(item["bbox"][0] for item in group)
+                    gy1 = min(item["bbox"][1] for item in group)
+                    gx2 = max(item["bbox"][2] for item in group)
+                    gy2 = max(item["bbox"][3] for item in group)
+                    
+                    ox1, oy1, ox2, oy2 = other_elem["bbox"]
+                    
+                    # Horizontal overlap check (min 50% column align)
+                    x_overlap = max(0.0, min(gx2, ox2) - max(gx1, ox1))
+                    min_w = min(gx2 - gx1, ox2 - ox1)
+                    same_col = (x_overlap / min_w > 0.5) if min_w > 0.0 else False
+                    
+                    # Vertical gap check (< 6% page height)
+                    y_gap = max(0.0, oy1 - gy2) if oy1 >= gy2 else max(0.0, gy1 - oy2)
+                    close_vertically = y_gap < 0.06
+                    
+                    if same_col and close_vertically:
+                        group.append(other_elem)
+                        used_indices.add(other_idx)
+                        merged = True
+        
+        gx1 = min(item["bbox"][0] for item in group)
+        gy1 = min(item["bbox"][1] for item in group)
+        gx2 = max(item["bbox"][2] for item in group)
+        gy2 = max(item["bbox"][3] for item in group)
+        
+        combined_text = " ".join([item["text"] for item in group if item["text"]])
+        avg_conf = sum(item["confidence"] for item in group) / len(group)
+        primary_label = elem["label"]
+
+        grouped_elements.append({
+            "bbox": [gx1, gy1, gx2, gy2],
+            "label": primary_label,
+            "confidence": avg_conf,
+            "text": combined_text
+        })
+
+    # 3. Apply high-fidelity classification heuristics
+    semantic_elements = []
+    for elem in grouped_elements:
+        x1, y1, x2, y2 = elem["bbox"]
+        label = elem["label"]
+        text = elem["text"]
+        
+        y_center = (y1 + y2) / 2.0
+        h_span = y2 - y1
+        w_span = x2 - x1
+        
+        # Page-Header: Top 15% center height, short
+        if y_center < 0.15 and h_span < 0.10:
+            label = "page-header"
+        # Page-Footer: Bottom 15% center height, short
+        elif y_center > 0.85 and h_span < 0.10:
+            label = "page-footer"
+        # Caption: Starts with common caption tokens or is very short and near a diagram
+        elif label == "text" and (
+            text.lower().startswith(("figure", "fig", "table", "chart", "notes:", "source:", "diagram", "abbreviation"))
+            or (h_span < 0.05 and any(e["label"] in ("image", "table", "chart", "diagram", "figure", "shape") for e in grouped_elements if e != elem))
+        ):
+            label = "caption"
+        # Diagram: Non-text regions
+        elif label in ("image", "table", "chart", "diagram", "figure", "shape"):
+            label = "diagram" if label != "table" else "table"
+        else:
+            label = "text"
+            
+        semantic_elements.append({
+            "bbox": [x1, y1, x2, y2],
+            "label": label,
+            "confidence": elem["confidence"],
+            "text": text
+        })
+
+    return semantic_elements
+
+
+    async def _analyze_with_ocr_backends(
         self,
         slide_idx: int,
         slide: dict,
         guardrail: GuardrailSchema,
-        layout_predictor=None,
-    ) -> tuple[list[Annotation], list[dict], str]:
+        recommended_backend: str,
+        supported_backends: list[str],
+    ) -> tuple[list[Annotation] | None, list[dict], str | None]:
         """
-        Use Surya LayoutPredictor on the rasterized slide PNG.
-        Returns (annotations, visuals_list, density_str)
+        Try OCR backends in priority order: recommended first, then others, then None.
+        
+        Returns:
+            (annotations, visuals, detection_method) where annotations=None if all backends fail
         """
         from PIL import Image
-
-        annotations = []
-        visuals = []
-        density_label = "Medium"
+        from app.services.ocr_detectors import detect_layout_blocks
 
         preview_path = slide.get("preview_path")
         if not preview_path or not Path(preview_path).exists():
-            return [], [], "Low"
+            return None, [], None
 
         try:
             with Image.open(preview_path) as img_source:
                 img = img_source.convert("RGB")
             width, height = img.size
+        except Exception as e:
+            logger.error(f"Failed to load slide preview for OCR: {e}")
+            return None, [], None
 
-            predict_fn = layout_predictor if callable(layout_predictor) else None
-            if predict_fn is None:
-                return (
-                    self._analyze_with_pptx_coords(slide_idx, slide, guardrail),
-                    self._get_visual_blocks_from_pptx(slide),
-                    "Medium",
-                )
+        # Build priority list of backends to try
+        backends_to_try = []
+        if recommended_backend in supported_backends:
+            backends_to_try.append(recommended_backend)
+        # Add remaining supported backends
+        for backend in supported_backends:
+            if backend not in backends_to_try:
+                backends_to_try.append(backend)
 
-            # Run Surya layout detection
-            layout_outputs = predict_fn([img])
-            if not layout_outputs:
-                return (
-                    self._analyze_with_pptx_coords(slide_idx, slide, guardrail),
-                    self._get_visual_blocks_from_pptx(slide),
-                    "Medium",
-                )
-            layout_result = layout_outputs[0]
-            blocks = (
-                layout_result.bboxes
-            )  # list of LayoutBox with label, bbox, confidence
+        logger.info(f"Trying OCR backends in order: {backends_to_try}")
 
-            # Convert Surya bboxes to frontend format (percentage-based or absolute)
-            # Frontend BoundingBox expects {top, left, width, height, label}
-            for b in blocks:
-                visuals.append(
-                    {
-                        "top": (b.bbox[1] / height) * 100,
-                        "left": (b.bbox[0] / width) * 100,
-                        "width": ((b.bbox[2] - b.bbox[0]) / width) * 100,
-                        "height": ((b.bbox[3] - b.bbox[1]) / height) * 100,
-                        "label": b.label,
-                        "visual_key": f"{b.label}_{len(visuals)}",
-                    }
-                )
+        for backend_name in backends_to_try:
+            try:
+                logger.debug(f"Attempting {backend_name} detection for slide {slide_idx}")
+                blocks = detect_layout_blocks(img, backend_name)
 
-            # --- Check: is a page-footer present? ---
-            footer_blocks = [b for b in blocks if b.label in ("footer", "page-footer")]
-            if not footer_blocks:
-                layout_rules = (
-                    guardrail.discovered_patterns.get("visual", {})
-                    if guardrail.discovered_patterns
-                    else {}
-                )
-                if layout_rules.get("footer_required", False):
-                    annotations.append(
-                        Annotation(
-                            slide_index=slide_idx,
-                            text=slide.get("title", ""),
-                            category="visual",
-                            severity="warning",
-                            message="Footer not detected on slide",
-                            suggestion="Add a footer with confidentiality notice and date per guardrail rules",
-                        )
+                # --- Hybrid Detection Fusion: Combine OCR text with OpenCV visual shapes ---
+                if blocks:
+                    from app.services.opencv_detector import OpenCVLayoutDetector
+                    try:
+                        opencv_detector = OpenCVLayoutDetector()
+                        if opencv_detector.available:
+                            cv_elements = opencv_detector.detect_elements(preview_path)
+                            for cv_elem in cv_elements:
+                                cx1, cy1, cx2, cy2 = cv_elem["bbox"]
+                                cx1_norm, cy1_norm = cx1 / width, cy1 / height
+                                cx2_norm, cy2_norm = cx2 / width, cy2 / height
+                                
+                                # Focus on OpenCV's high-fidelity non-text elements (images, tables, shapes)
+                                if cv_elem["label"] in ("image", "table", "chart", "shape", "diagram"):
+                                    # Check for high spatial overlap with any existing OCR text block
+                                    overlap = False
+                                    for ocr_block in blocks:
+                                        ox1, oy1, ox2, oy2 = ocr_block.get("bbox", [0, 0, 1, 1])
+                                        
+                                        # Calculate overlap ratio
+                                        ix1 = max(cx1_norm, ox1)
+                                        iy1 = max(cy1_norm, oy1)
+                                        ix2 = min(cx2_norm, ox2)
+                                        iy2 = min(cy2_norm, oy2)
+                                        
+                                        if ix2 > ix1 and iy2 > iy1:
+                                            inter_area = (ix2 - ix1) * (iy2 - iy1)
+                                            cv_area = (cx2_norm - cx1_norm) * (cy2_norm - cy1_norm)
+                                            if cv_area > 0 and (inter_area / cv_area) > 0.4:
+                                                overlap = True
+                                                break
+                                                
+                                    if not overlap:
+                                        blocks.append({
+                                            "bbox": [cx1_norm, cy1_norm, cx2_norm, cy2_norm],
+                                            "label": cv_elem["label"],
+                                            "confidence": cv_elem.get("confidence", 0.5),
+                                            "text": ""
+                                        })
+                    except Exception as cv_err:
+                        logger.debug(f"OpenCV hybrid fusion helper failed: {cv_err}")
+
+                if not blocks:
+                    logger.debug(f"{backend_name} returned no blocks")
+                    continue
+
+                # Group and semantically classify blocks
+                semantic_blocks = _classify_and_merge_layout(blocks, width, height)
+
+                # Convert blocks to frontend format and annotations
+                annotations = []
+                visuals = []
+
+                for b in semantic_blocks:
+                    x1, y1, x2, y2 = b.get("bbox", [0, 0, 1, 1])
+                    label = b.get("label", "text")
+
+                    visuals.append({
+                        "top": y1 * 100,
+                        "left": x1 * 100,
+                        "width": (x2 - x1) * 100,
+                        "height": (y2 - y1) * 100,
+                        "label": label,
+                        "visual_key": f"{label}_{len(visuals)}",
+                        "confidence": b.get("confidence", 0.7),
+                    })
+
+                # Check for footer (placeholder check)
+                if not any(v["label"].lower() in ("footer", "page-footer") for v in visuals):
+                    layout_rules = (
+                        guardrail.discovered_patterns.get("visual", {})
+                        if guardrail.discovered_patterns
+                        else {}
                     )
+                    if layout_rules.get("footer_required", False):
+                        annotations.append(
+                            Annotation(
+                                slide_index=slide_idx,
+                                text=slide.get("title", ""),
+                                category="visual",
+                                severity="warning",
+                                message="Footer not detected on slide",
+                                suggestion="Add a footer with confidentiality notice and date per guardrail rules",
+                            )
+                        )
 
-            # --- Check: text density using Surya text block areas ---
-            text_blocks = [
-                b
-                for b in blocks
-                if b.label in ("text", "section-header", "list-group", "caption")
-            ]
-            if text_blocks:
-                text_area = sum(
-                    (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1])
-                    for b in text_blocks
-                )
-                slide_area = width * height
-                density = text_area / slide_area if slide_area > 0 else 0
+                # Check text density
+                text_blocks = [
+                    v for v in visuals
+                    if v["label"].lower() in ("text", "section-header", "list", "caption")
+                ]
+                if text_blocks:
+                    text_area = sum(
+                        (v["width"] * v["height"]) / 10000  # Convert from percentage^2 to fraction
+                        for v in text_blocks
+                    )
+                    density = text_area if text_area <= 1 else text_area / 100
 
-                if density > 0.4:
-                    density_label = "High"
-                elif density < 0.15:
-                    density_label = "Low"
+                    lang_rules = guardrail.language_rules or {}
+                    max_density = lang_rules.get("max_text_density", 0.55)
+
+                    if density > max_density:
+                        annotations.append(
+                            Annotation(
+                                slide_index=slide_idx,
+                                text=slide.get("title", ""),
+                                category="visual",
+                                severity="warning",
+                                message=f"High text density ({density:.1%}) — slide may be too text-heavy",
+                                suggestion="Consider splitting into two slides or using visual summaries",
+                            )
+                        )
                 else:
-                    density_label = "Medium"
+                    logger.info(f"Successfully used {backend_name} detection for slide {slide_idx} ({len(visuals)} blocks)")
+                return annotations, visuals, backend_name
 
-                lang_rules = guardrail.language_rules or {}
-                max_density = lang_rules.get("max_text_density", 0.55)
+            except Exception as e:
+                logger.warning(f"{backend_name} detection failed for slide {slide_idx}: {e}")
+                continue
 
-                if density > max_density:
-                    annotations.append(
-                        Annotation(
-                            slide_index=slide_idx,
-                            text=slide.get("title", ""),
-                            category="visual",
-                            severity="warning",
-                            message=f"High text density ({density:.1%}) — slide may be too text-heavy",
-                            suggestion="Consider splitting into two slides or using visual summaries",
-                        )
-                    )
+        # All backends failed
+        logger.warning(f"All OCR backends failed for slide {slide_idx}")
+        return None, [], None
 
-            # --- Check: figure/chart count vs slide text ratio ---
-            figure_blocks = [
-                b for b in blocks if b.label in ("figure", "image", "table")
-            ]
-            total_blocks = len(blocks)
-            if (
-                total_blocks > 0
-                and len(figure_blocks) / total_blocks < 0.1
-                and total_blocks > 6
-            ):
+    async def _analyze_with_opencv(
+        self,
+        slide_idx: int,
+        slide: dict,
+        guardrail: GuardrailSchema,
+    ) -> tuple[list[Annotation], list[dict]]:
+        """
+        Use OpenCV-based fast object detection as fallback when OCR backends are unavailable.
+        Much faster than deep learning models, doesn't require GPU.
+        """
+        from app.services.opencv_detector import OpenCVLayoutDetector
+        from pathlib import Path
+
+        annotations = []
+        visuals = []
+
+        preview_path = slide.get("preview_path")
+        if not preview_path or not Path(preview_path).exists():
+            return [], []
+
+        try:
+            detector = OpenCVLayoutDetector()
+            if not detector.available:
+                return [], []
+
+            # Run OpenCV detection
+            detected_elements = detector.detect_elements(preview_path)
+            
+            if not detected_elements:
+                return [], []
+
+            # Load image dimensions
+            from PIL import Image
+            with Image.open(preview_path) as img:
+                width, height = img.size
+
+            # Convert OpenCV format to blocks structure with normalized bounds
+            blocks = []
+            for elem in detected_elements:
+                x1, y1, x2, y2 = elem["bbox"]
+                blocks.append({
+                    "bbox": [x1 / width, y1 / height, x2 / width, y2 / height],
+                    "label": elem["label"],
+                    "confidence": elem.get("confidence", 0.5),
+                    "text": ""  # OpenCV doesn't read text content
+                })
+
+            # Group and semantically classify blocks
+            semantic_blocks = _classify_and_merge_layout(blocks, width, height)
+
+            for b in semantic_blocks:
+                x1, y1, x2, y2 = b.get("bbox", [0.0, 0.0, 1.0, 1.0])
+                label = b.get("label", "text")
+
+                visuals.append({
+                    "top": y1 * 100,
+                    "left": x1 * 100,
+                    "width": (x2 - x1) * 100,
+                    "height": (y2 - y1) * 100,
+                    "label": label,
+                    "visual_key": f"{label}_{len(visuals)}",
+                    "confidence": b.get("confidence", 0.5),
+                })
+
+            # Generate annotations based on detected elements
+            if not visuals:
                 annotations.append(
                     Annotation(
                         slide_index=slide_idx,
                         text=slide.get("title", ""),
                         category="visual",
                         severity="suggestion",
-                        message="Slide is very text-heavy with few visuals",
-                        suggestion="Consider adding a chart, diagram, or table to support the narrative",
+                        message="Slide layout could not be analyzed in detail",
+                        suggestion="Try re-rendering or checking if the slide preview is complete",
                     )
                 )
 
-            return annotations, visuals, density_label
+            return annotations, visuals
 
         except Exception as e:
-            print(f"Surya analysis failed for slide {slide_idx}: {e}")
-            return [], [], "Medium"
+            logger.error(f"OpenCV analysis failed for slide {slide_idx}: {e}")
+            return [], []
 
     def _analyze_with_pptx_coords(
         self, slide_idx: int, slide: dict, guardrail: GuardrailSchema
     ) -> list[Annotation]:
         """
-        Fallback when Surya is not installed.
+        Fallback when OCR backends and OpenCV are not available.
         Uses EMU coordinates from python-pptx to estimate layout compliance.
         """
         annotations = []
@@ -1196,6 +1609,10 @@ class VisualAnalysisAgent:
         annotations = []
         image_analysis = []
 
+        provider = str(getattr(inference_service, "current_provider", "unknown"))
+        is_local = provider in ("lm_studio", "ollama", "transformers", "mlx")
+        vision_sem = _local_vision_semaphore if is_local else _remote_vision_semaphore
+
         images = slide.get("images", [])
         charts = slide.get("charts", [])
         detected_visuals = detected_visuals or []
@@ -1258,10 +1675,27 @@ class VisualAnalysisAgent:
 
             if chart_crop is not None:
                 try:
-                    async with _vision_semaphore:
-                        chart_vision = await vision_service.extract_chart_data(
-                            chart_crop
-                        )
+                    # Check vision cache first (7-day TTL)
+                    crop_bytes = io.BytesIO()
+                    chart_crop.save(crop_bytes, format="PNG")
+                    crop_bytes.seek(0)
+                    crop_data = crop_bytes.getvalue()
+                    image_key = _image_digest(crop_data)
+                    
+                    # Try cache hit
+                    cached_vision = _vision_cache_get(image_key)
+                    if cached_vision:
+                        logger.info(f"Vision cache HIT for chart {chart.get('id', '')}")
+                        chart_vision = json.loads(cached_vision)
+                    else:
+                        logger.info(f"Vision cache MISS for chart {chart.get('id', '')} — calling vision service")
+                        async with vision_sem:
+                            chart_vision = await vision_service.extract_chart_data(
+                                chart_crop
+                            )
+                        # Store in cache
+                        _vision_cache_set(image_key, json.dumps(chart_vision))
+                    
                     image_analysis[-1]["vision_summary"] = chart_vision
                 except Exception as ve:
                     logger.error(f"Chart vision failed for {chart.get('id', '')}: {ve}")
@@ -1273,8 +1707,25 @@ class VisualAnalysisAgent:
             if table_crop is None:
                 continue
             try:
-                async with _vision_semaphore:
-                    table_res = await vision_service.extract_table_content(table_crop)
+                # Check vision cache first (7-day TTL)
+                crop_bytes = io.BytesIO()
+                table_crop.save(crop_bytes, format="PNG")
+                crop_bytes.seek(0)
+                crop_data = crop_bytes.getvalue()
+                image_key = _image_digest(crop_data)
+                
+                # Try cache hit
+                cached_vision = _vision_cache_get(image_key)
+                if cached_vision:
+                    logger.info(f"Vision cache HIT for table {table_id}")
+                    table_res = json.loads(cached_vision)
+                else:
+                    logger.info(f"Vision cache MISS for table {table_id} — calling vision service")
+                    async with vision_sem:
+                        table_res = await vision_service.extract_table_content(table_crop)
+                    # Store in cache
+                    _vision_cache_set(image_key, json.dumps(table_res))
+                
                 discrepancies = self._cross_reference_table(
                     str(table.get("text") or ""),
                     table_res or {},
@@ -1349,16 +1800,32 @@ class VisualAnalysisAgent:
                     )
                 )
 
-            # --- VISON MODEL CALL ---
+            # --- VISION MODEL CALL ---
             if has_content and img_data:
                 try:
                     # Convert b64 to PIL
                     with Image.open(io.BytesIO(base64.b64decode(img_data))) as img_raw:
                         img_pil = img_raw.convert("RGB")
 
-                    # Call multimodal model
-                    async with _vision_semaphore:
-                        vision_res = await vision_service.describe_image(img_pil)
+                    # Check vision cache first (7-day TTL)
+                    img_bytes = io.BytesIO()
+                    img_pil.save(img_bytes, format="PNG")
+                    img_bytes.seek(0)
+                    img_data_bytes = img_bytes.getvalue()
+                    image_key = _image_digest(img_data_bytes)
+                    
+                    # Try cache hit
+                    cached_vision = _vision_cache_get(image_key)
+                    if cached_vision:
+                        logger.info(f"Vision cache HIT for image {img_id}")
+                        vision_res = json.loads(cached_vision)
+                    else:
+                        logger.info(f"Vision cache MISS for image {img_id} — calling vision service")
+                        # Call multimodal model
+                        async with vision_sem:
+                            vision_res = await vision_service.describe_image(img_pil)
+                        # Store in cache
+                        _vision_cache_set(image_key, json.dumps(vision_res))
 
                     if vision_res.get("relevance") == "low":
                         annotations.append(
@@ -1392,8 +1859,25 @@ class VisualAnalysisAgent:
 
             if preview_crop is not None:
                 try:
-                    async with _vision_semaphore:
-                        vision_res = await vision_service.describe_image(preview_crop)
+                    # Check vision cache first (7-day TTL)
+                    crop_bytes = io.BytesIO()
+                    preview_crop.save(crop_bytes, format="PNG")
+                    crop_bytes.seek(0)
+                    crop_data = crop_bytes.getvalue()
+                    image_key = _image_digest(crop_data)
+                    
+                    # Try cache hit
+                    cached_vision = _vision_cache_get(image_key)
+                    if cached_vision:
+                        logger.info(f"Vision cache HIT for preview crop {img_id}")
+                        vision_res = json.loads(cached_vision)
+                    else:
+                        logger.info(f"Vision cache MISS for preview crop {img_id} — calling vision service")
+                        async with vision_sem:
+                            vision_res = await vision_service.describe_image(preview_crop)
+                        # Store in cache
+                        _vision_cache_set(image_key, json.dumps(vision_res))
+                    
                     if vision_res.get("relevance") == "low":
                         annotations.append(
                             Annotation(
@@ -1456,7 +1940,7 @@ class VisualAnalysisAgent:
             f"Slide {slide_idx}: {len(images)} images, {len(charts)} charts analyzed"
         )
 
-        # Fallback for PDFs/screenshots: analyze cropped figure/table regions detected by Surya
+        # Fallback for PDFs/screenshots: analyze cropped figure/table regions from OCR backends
         if detected_visuals:
             surrogate_blocks = [
                 block
@@ -1479,7 +1963,7 @@ class VisualAnalysisAgent:
                         continue
                     block_label = str(block.get("label", "figure")).lower()
                     if block_label == "table":
-                        async with _vision_semaphore:
+                        async with vision_sem:
                             table_res = await vision_service.extract_table_content(crop)
                         vision_res = {
                             "description": table_res.get("table_summary", ""),
@@ -1491,12 +1975,12 @@ class VisualAnalysisAgent:
                         }
                     else:
                         table_res = None
-                        async with _vision_semaphore:
+                        async with vision_sem:
                             vision_res = await vision_service.describe_image(crop)
                     image_analysis.append(
                         {
-                            "type": "surya_block",
-                            "id": f"surya_{slide_idx}_{block_idx}",
+                            "type": "detected_block",
+                            "id": f"detected_{slide_idx}_{block_idx}",
                             "label": block.get("label", "figure"),
                             "vision_description": vision_res.get("description"),
                             "visible_text": vision_res.get("visible_text", []),
@@ -1539,7 +2023,7 @@ class VisualAnalysisAgent:
                         )
                 except Exception as ve:
                     logger.error(
-                        f"Surya block vision failed on slide {slide_idx}: {ve}"
+                        f"Detected block vision failed on slide {slide_idx}: {ve}"
                     )
 
         return annotations, image_analysis

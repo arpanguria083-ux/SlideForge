@@ -1,0 +1,183 @@
+{
+  "schema_version": 3,
+  "comment": "Multi-backend OCR manifest. available_in_lite=false means the backend library is not bundled in the LITE EXE and cannot be used there.",
+  "backends": [
+    {
+      "id": "paddleocr",
+      "label": "PaddleOCR",
+      "description": "Highest accuracy on complex documents (tables, formulas, 109 languages). Best with CUDA or MPS; use quantized on CPU.",
+      "git_repo": "https://github.com/PaddlePaddle/PaddleOCR.git",
+      "recommended_for": [
+        "cuda",
+        "mps"
+      ],
+      "size_label": "~900 MB",
+      "install_type": "pip",
+      "pip_package": "paddlepaddle",
+      "pip_extras": [
+        "paddleocr"
+      ],
+      "min_ram_mb": 8000,
+      "available_in_lite": false,
+      "lite_note": "Requires paddleocr package. Not bundled in LITE build. Install python-doctr or paddleocr separately and use full installation.",
+      "models": [
+        {
+          "id": "paddleocr_det",
+          "label": "Text Detection (DB++)",
+          "hf_repo": "PaddlePaddle/PaddleOCR-VL",
+          "hf_revision": "main",
+          "hf_subfolder": "",
+          "local_dir": "paddleocr/det",
+          "total_bytes": 0,
+          "files": [
+            {
+              "path": "inference.pdmodel",
+              "bytes": 0,
+              "sha256": ""
+            },
+            {
+              "path": "inference.pdiparams",
+              "bytes": 0,
+              "sha256": ""
+            }
+          ]
+        },
+        {
+          "id": "paddleocr_rec",
+          "label": "Text Recognition (SVTR-LCNet)",
+          "hf_repo": "PaddlePaddle/PaddleOCR-VL",
+          "hf_revision": "main",
+          "hf_subfolder": "",
+          "local_dir": "paddleocr/rec",
+          "total_bytes": 0,
+          "files": [
+            {
+              "path": "inference.pdmodel",
+              "bytes": 0,
+              "sha256": ""
+            },
+            {
+              "path": "inference.pdiparams",
+              "bytes": 0,
+              "sha256": ""
+            }
+          ]
+        },
+        {
+          "id": "paddleocr_cls",
+          "label": "Text Angle Classifier",
+          "hf_repo": "PaddlePaddle/PaddleOCR-VL",
+          "hf_revision": "main",
+          "hf_subfolder": "",
+          "local_dir": "paddleocr/cls",
+          "total_bytes": 0,
+          "files": [
+            {
+              "path": "inference.pdmodel",
+              "bytes": 0,
+              "sha256": ""
+            },
+            {
+              "path": "inference.pdiparams",
+              "bytes": 0,
+              "sha256": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "got_ocr2",
+      "label": "GOT-OCR 2.0",
+      "description": "580M-parameter end-to-end OCR. Excellent on tables, charts, equations. Included in the LITE build — download once and use offline.",
+      "recommended_for": [
+        "mps",
+        "cpu_high_ram"
+      ],
+      "size_label": "~1.4 GB",
+      "install_type": "pip",
+      "pip_package": "transformers",
+      "pip_extras": [],
+      "min_ram_mb": 8000,
+      "available_in_lite": true,
+      "models": [
+        {
+          "id": "got_ocr2_model",
+          "label": "GOT-OCR2 (stepfun-ai/GOT-OCR2_0)",
+          "hf_repo": "stepfun-ai/GOT-OCR2_0",
+          "hf_revision": "main",
+          "hf_subfolder": "",
+          "local_dir": "got_ocr2",
+          "total_bytes": 1432121416,
+          "files": [
+            {
+              "path": "model.safetensors",
+              "bytes": 0,
+              "sha256": ""
+            },
+            {
+              "path": "config.json",
+              "bytes": 0,
+              "sha256": ""
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 0,
+              "sha256": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "doctr",
+      "label": "docTR (Mindee)",
+      "description": "Lightest (~200-400 MB). Excellent CPU performance, great for printed text, receipts and forms. Works everywhere.",
+      "recommended_for": [
+        "cpu",
+        "cpu_low_ram"
+      ],
+      "size_label": "~200-400 MB",
+      "install_type": "pip",
+      "pip_package": "python-doctr[torch]",
+      "pip_extras": [],
+      "min_ram_mb": 2000,
+      "available_in_lite": false,
+      "lite_note": "Requires python-doctr package. Not bundled in LITE build. The model repository (mindee/doctr) is also private on HuggingFace — models are downloaded automatically by the python-doctr library on first use.",
+      "models": [
+        {
+          "id": "doctr_det",
+          "label": "DBNet detection (db_resnet50)",
+          "hf_repo": "mindee/doctr",
+          "hf_revision": "main",
+          "hf_subfolder": "",
+          "local_dir": "doctr/models",
+          "total_bytes": 0,
+          "files": [
+            {
+              "path": "db_resnet50-79bd7d70.pt",
+              "bytes": 0,
+              "sha256": ""
+            }
+          ]
+        },
+        {
+          "id": "doctr_rec",
+          "label": "CRNN recognition (crnn_vgg16_bn)",
+          "hf_repo": "mindee/doctr",
+          "hf_revision": "main",
+          "hf_subfolder": "",
+          "local_dir": "doctr/models",
+          "total_bytes": 0,
+          "files": [
+            {
+              "path": "crnn_vgg16_bn-0417f351.pt",
+              "bytes": 0,
+              "sha256": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

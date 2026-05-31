@@ -244,9 +244,9 @@ export interface SlideAnalysis {
   slideContext?: SlideContext | null;
   guardrailCoverage?: GuardrailCoverageItem[];
   analysisBackends?: {
-    surya: boolean;
+    layout: 'ocr_backend' | 'pptx' | 'unknown' | string;
     vision: 'lm_studio' | 'fallback' | 'unavailable' | 'unknown' | string;
-    ocr: 'surya' | 'native' | 'unknown' | string;
+    ocr: 'got_ocr2' | 'paddleocr' | 'doctr' | 'native' | 'unknown' | string;
   };
   dynamicScorecard?: {
     schema_version: string;
@@ -277,6 +277,38 @@ export interface SlideAnalysis {
   };
 }
 
+export interface RuntimeAssetFileStatus {
+  name: string;
+  relative_path: string;
+  size_bytes: number;
+  modified_at: number;
+}
+
+export interface OcrRuntimeStatus {
+  phase: string;
+  message: string;
+  download_active: boolean;
+  download_required: boolean;
+  offline_ready: boolean;
+  bundled_seeded: boolean;
+  cache_dir: string | null;
+  tmp_dir: string | null;
+  files: RuntimeAssetFileStatus[];
+  updated_at: number | null;
+  layout_loaded: boolean;
+  recognition_loaded: boolean;
+  detector_loaded: boolean;
+  foundation_loaded: boolean;
+  cooldown_active: boolean;
+  last_error: string | null;
+}
+
+export interface RuntimeAssetStatusResponse {
+  ocr: OcrRuntimeStatus;
+  download_active: boolean;
+  download_required: boolean;
+}
+
 export interface SlideModel {
   id: string;
   file: File;
@@ -288,5 +320,71 @@ export interface SlideModel {
 
 export enum ViewMode {
   UPLOAD = 'UPLOAD',
-  DASHBOARD = 'DASHBOARD'
+  DASHBOARD = 'DASHBOARD',
+  DIAGNOSTICS = 'DIAGNOSTICS'
+}
+
+export interface OcrJobStatus {
+  job_id: string;
+  status: 'idle' | 'running' | 'completed' | 'failed' | 'cancelled' | 'cancelling' | 'already_running';
+  phase: string;
+  message: string;
+  progress: number;
+  total: number;
+  bytes_done?: number;
+  bytes_total?: number;
+  backend_id?: string | null;
+  error?: string | null;
+  download_active?: boolean;
+}
+
+// ── Multi-backend OCR types ──────────────────────────────────────────────────
+
+export interface OcrDeviceCapabilities {
+  platform: 'windows' | 'macos' | 'linux';
+  python_arch: string;
+  cuda_available: boolean;
+  cuda_device_name: string | null;
+  cuda_vram_mb: number | null;
+  mps_available: boolean;
+  ram_total_mb: number;
+  ram_available_mb: number;
+  recommended_backend: OcrBackendId;
+  recommended_reason: string;
+  all_supported_backends: OcrBackendId[];
+}
+
+export type OcrBackendId = 'paddleocr' | 'got_ocr2' | 'doctr';
+
+export interface OcrModelStatus {
+  id: string;
+  label: string;
+  hf_repo: string;
+  total_bytes: number;
+  present: boolean;
+  valid: boolean;
+  bytes_present: number;
+}
+
+export interface OcrBackendInfo {
+  id: OcrBackendId;
+  label: string;
+  description: string;
+  recommended_for: string[];
+  size_label: string;
+  min_ram_mb: number;
+  ready: boolean;
+  available_in_lite?: boolean;
+  bytes_present: number;
+  bytes_required: number;
+  models: OcrModelStatus[];
+  // Computed by the API
+  active?: boolean;
+  recommended?: boolean;
+}
+
+export interface OcrBackendsResponse {
+  device: OcrDeviceCapabilities;
+  active_backend: OcrBackendId;
+  backends: OcrBackendInfo[];
 }

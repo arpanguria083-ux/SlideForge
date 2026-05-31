@@ -5,15 +5,18 @@ import SlideCanvas from './SlideCanvas';
 import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 import { 
   ChevronRight, Layout, AlertTriangle, CheckCircle2, FileText, 
-  Download, Loader2, AlertCircle, FileCheck, ShieldCheck, Settings2, Bot, Scale
+  Download, Loader2, AlertCircle, FileCheck, ShieldCheck, Settings2, Bot, Scale, Server
 } from 'lucide-react';
 import IssuePanel from './IssuePanel';
 import GuardrailView from './GuardrailView';
 import AuditLog from './AuditLog';
 import TemplateDiscovery from './TemplateDiscovery';
 import EvidencePanel from './EvidencePanel';
+import AgenticFlowPanel from './AgenticFlowPanel';
 import { apiService, Annotation } from '../services/apiService';
 import { useAnalysisSettings, useGrammarStatus, useSessionMetrics } from '../services/queries/settings';
+
+const SCORE_COLORS = ['#4f46e5', '#e2e8f0'];
 
 interface DashboardProps {
   sessionId: string;
@@ -22,9 +25,11 @@ interface DashboardProps {
   annotations: Annotation[];
   onRefreshAnalysis: () => Promise<void>;
   onUpdateSlideAnalysis: (slideIndex: number, analysis: SlideModel['analysis']) => void;
+  onOpenDiagnostics: () => void;
+  onCloseSession?: () => void;
 }
 
-const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, annotations, onRefreshAnalysis, onUpdateSlideAnalysis }) => {
+const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, annotations, onRefreshAnalysis, onUpdateSlideAnalysis, onOpenDiagnostics, onCloseSession }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isIssuePanelOpen, setIsIssuePanelOpen] = useState(true);
   const [activeTab, setActiveTab] = useState<'evaluation' | 'evidence' | 'guardrails' | 'auditlog' | 'discovery'>('evaluation');
@@ -44,6 +49,7 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
   const [analysisMaxTokens, setAnalysisMaxTokens] = useState(800);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [showDeepAnalysis, setShowDeepAnalysis] = useState(false);
   const [selectedVisualKey, setSelectedVisualKey] = useState<string | null>(null);
@@ -77,7 +83,6 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
     { name: 'Score', value: analysis.overallScore },
     { name: 'Gap', value: 100 - analysis.overallScore },
   ] : [];
-  const COLORS = ['#4f46e5', '#e2e8f0'];
   const scoreBreakdown = analysis?.scoreBreakdown ? [
     { label: 'Message', value: analysis.scoreBreakdown.message_clarity },
     { label: 'Evidence', value: analysis.scoreBreakdown.evidence_strength },
@@ -91,13 +96,38 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
     : analysis?.reliability?.status === 'moderate'
       ? 'bg-amber-100 text-amber-700 border-amber-200'
       : 'bg-rose-100 text-rose-700 border-rose-200';
-  const tableInsights = (analysis?.imageAnalysis || []).filter((item) =>
-    item.type === 'table_vision' || (item.type === 'surya_block' && (item.label || '').toLowerCase().includes('table'))
+  const tableInsights = useMemo(
+    () => (analysis?.imageAnalysis || []).filter((item) =>
+      item.type === 'table_vision'
+    ),
+    [analysis]
   );
-  const chartInsights = (analysis?.imageAnalysis || []).filter((item) => item.type === 'chart');
-  const imageInsights = (analysis?.imageAnalysis || []).filter((item) => item.type === 'image' || item.type === 'surya_block');
-  const grammarFindings = (analysis?.deepAnalysis?.judge?.findings || []).filter((finding) => finding.category === 'grammar');
-  const languageFindings = (analysis?.deepAnalysis?.judge?.findings || []).filter((finding) => finding.category !== 'grammar');
+
+  const chartInsights = useMemo(
+    () => (analysis?.imageAnalysis || []).filter((item) => item.type === 'chart'),
+    [analysis]
+  );
+
+  const imageInsights = useMemo(
+    () => (analysis?.imageAnalysis || []).filter(
+      (item) => item.type === 'image'
+    ),
+    [analysis]
+  );
+
+  const grammarFindings = useMemo(
+    () => (analysis?.deepAnalysis?.judge?.findings || []).filter(
+      (finding) => finding.category === 'grammar'
+    ),
+    [analysis]
+  );
+
+  const languageFindings = useMemo(
+    () => (analysis?.deepAnalysis?.judge?.findings || []).filter(
+      (finding) => finding.category !== 'grammar'
+    ),
+    [analysis]
+  );
   const issueCounts = useMemo(
     () =>
       annotations.reduce(
@@ -120,8 +150,11 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
     currentSlideIssues.find((item) => item.severity === 'hard_block') ||
     currentSlideIssues.find((item) => item.severity === 'warning') ||
     currentSlideIssues[0];
+  const currentSlideIssuesCount = currentSlideIssues.filter(
+    (item) => item.severity === 'hard_block' || item.severity === 'warning'
+  ).length;
   const analysisBackends = analysis?.analysisBackends;
-  const suryaLabel = analysisBackends?.surya ? 'Surya layout' : 'PPTX layout';
+  const layoutLabel = 'PPTX layout';
   const visionLabel =
     analysisBackends?.vision === 'lm_studio'
       ? 'Vision model'
@@ -129,8 +162,8 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
         ? 'Vision fallback'
         : 'Vision unknown';
   const ocrLabel =
-    analysisBackends?.ocr === 'surya'
-      ? 'Surya OCR'
+    analysisBackends?.ocr === 'paddle'
+      ? 'PaddleOCR'
       : analysisBackends?.ocr === 'native'
         ? 'Native text'
         : 'OCR unknown';
@@ -227,10 +260,14 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
   useEffect(() => {
     if (analysisSettingsQuery.error instanceof Error) {
       setSettingsError(analysisSettingsQuery.error.message);
-    } else if (grammarStatusQuery.error instanceof Error) {
+    }
+  }, [analysisSettingsQuery.error]);
+
+  useEffect(() => {
+    if (grammarStatusQuery.error instanceof Error) {
       setSettingsError(grammarStatusQuery.error.message);
     }
-  }, [analysisSettingsQuery.error, grammarStatusQuery.error]);
+  }, [grammarStatusQuery.error]);
 
   useEffect(() => {
     setSelectedVisualKey(null);
@@ -299,7 +336,8 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
       await apiService.downloadAnnotated(sessionId);
     } catch (err) {
       console.error(err);
-      alert('Failed to download annotated deck.');
+      setDownloadError('Failed to download annotated deck.');
+      window.setTimeout(() => setDownloadError(null), 5000);
     } finally {
       setIsDownloading(false);
     }
@@ -378,10 +416,12 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
 
             <div className="max-w-xl">
               <div className="text-sm font-medium text-slate-800">{slideSubheadline}</div>
-              <div className="mt-1 text-sm text-slate-500">
-                {activeIssueCount > 0
-                  ? `${activeIssueCount} priority item${activeIssueCount === 1 ? '' : 's'} still need attention.`
-                  : 'No priority issues are open right now.'}
+              <div className="mt-1 text-sm text-slate-500 font-medium">
+                {currentSlideIssuesCount > 0
+                  ? `${currentSlideIssuesCount} priority item${currentSlideIssuesCount === 1 ? '' : 's'} to fix on this slide (${activeIssueCount} total in deck).`
+                  : activeIssueCount > 0
+                    ? `No priority issues on this slide (${activeIssueCount} total in deck).`
+                    : 'No priority issues detected in deck.'}
               </div>
             </div>
 
@@ -449,6 +489,9 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                  {isDownloading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                  Download Marked Deck
               </button>
+              {downloadError && (
+                <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{downloadError}</div>
+              )}
               <button
                  onClick={handleRunRevisionLoop}
                  disabled={isRunningRevisionLoop}
@@ -457,6 +500,23 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                  {isRunningRevisionLoop ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}
                  Auto Polish
               </button>
+              <button
+                 onClick={onOpenDiagnostics}
+                 className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-xl transition-colors"
+              >
+                 <Server className="w-4 h-4" />
+                 Diagnostics
+              </button>
+              {onCloseSession && (
+                <button
+                   onClick={onCloseSession}
+                   className="flex items-center gap-2 px-3 py-1.5 text-sm font-bold text-rose-600 hover:bg-rose-50 rounded-xl border border-rose-100 transition-colors shadow-sm"
+                   title="Exit this workspace and upload a new slide deck"
+                >
+                   <AlertCircle className="w-4 h-4 text-rose-500 animate-pulse" />
+                   New Review
+                </button>
+              )}
                {isSenior && (
                  <button
                    onClick={openDeliveryModal}
@@ -471,7 +531,19 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
 
       <div className="flex-1 flex overflow-hidden">
         {/* Sidebar Navigation */}
-        <aside className="w-64 bg-white border-r border-slate-200 flex flex-col z-10">
+        <aside
+          className="w-64 bg-white border-r border-slate-200 flex flex-col z-10"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              setCurrentIndex((prev) => Math.min(prev + 1, slides.length - 1));
+            } else if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              setCurrentIndex((prev) => Math.max(prev - 1, 0));
+            }
+          }}
+        >
           <div className="p-4 border-b border-slate-100 bg-slate-50/50">
             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Slides</h3>
             {progress ? (
@@ -498,7 +570,21 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
             )}
           </div>
           <div className="flex-1 overflow-y-auto p-2 space-y-2">
-            {slides.map((slide, idx) => (
+            {slides.length === 0 ? (
+              /* Skeleton loading state */
+              <>
+                {[1,2,3,4,5].map((n) => (
+                  <div key={`skel-${n}`} className="flex items-center gap-3 p-2 rounded-lg">
+                    <div className="skeleton-shimmer w-12 h-8 flex-shrink-0" />
+                    <div className="min-w-0 flex-1 space-y-1.5">
+                      <div className="skeleton-shimmer h-3 w-16" />
+                      <div className="skeleton-shimmer h-2.5 w-24" />
+                    </div>
+                  </div>
+                ))}
+              </>
+            ) : (
+              slides.map((slide, idx) => (
               <button
                 key={slide.id}
                 onClick={() => setCurrentIndex(idx)}
@@ -548,12 +634,13 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                 </div>
                 {currentIndex === idx && <ChevronRight className="w-4 h-4 text-indigo-400" />}
               </button>
-            ))}
+            )))}
           </div>
         </aside>
 
         {/* Main Content */}
         <main className="flex-1 overflow-y-auto p-6 bg-slate-50/50">
+            <div className="fade-in-up">
             {activeTab === 'evaluation' ? (
                 <>
                     {(isAnalyzingCurrent || isIdleCurrent || !analysis) ? (
@@ -608,7 +695,7 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                                                     stroke="none"
                                                 >
                                                     {scoreData.map((entry, index) => (
-                                                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                                        <Cell key={`cell-${index}`} fill={SCORE_COLORS[index % SCORE_COLORS.length]} />
                                                     ))}
                                                 </Pie>
                                             </PieChart>
@@ -893,7 +980,9 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                                                 Deep analyzed {new Date(analysis.lastDeepAnalyzedAt).toLocaleTimeString()}
                                             </div>
                                         )}
-                                        <div className="text-[10px] font-bold text-slate-400">Zoom: 100%</div>
+                                        <div className="text-[10px] font-bold text-slate-400">
+                                          {currentSlide.slideData?.width || '-'}×{currentSlide.slideData?.height || 'preview'}
+                                        </div>
                                     </div>
                                 </div>
                                 <div className="flex-1 p-6 flex flex-col">
@@ -943,7 +1032,7 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                                         <div className="text-[9px] font-bold text-slate-400 uppercase tracking-tighter mb-1">Analysis sources</div>
                                         <div className="flex gap-2">
                                             <span className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full font-bold border border-slate-200 group-hover:bg-indigo-50 group-hover:text-indigo-600 transition-colors">LLM</span>
-                                            <span className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full font-bold border border-slate-200">{suryaLabel}</span>
+                                            <span className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full font-bold border border-slate-200">{layoutLabel}</span>
                                             <span className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full font-bold border border-slate-200">{visionLabel}</span>
                                             <span className="text-[10px] px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full font-bold border border-slate-200">{ocrLabel}</span>
                                         </div>
@@ -1130,6 +1219,12 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                             {showDeepAnalysis && (
                                 <div className="col-span-12 grid grid-cols-12 gap-6">
                                     <div className="col-span-8 bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+                                        <AgenticFlowPanel
+                                            sessionId={sessionId}
+                                            slideIndex={currentIndex}
+                                            deepAnalysis={analysis.deepAnalysis}
+                                            onRerunDeepAnalysis={handleDeepAnalyzeCurrentSlide}
+                                        />
                                         <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 mb-4">
                                             <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">LLM Understanding</div>
                                             <div className="text-sm text-slate-800 mb-3">
@@ -1437,9 +1532,11 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
                   await refreshCurrentSlideAnalysis();
                 }} />
             )}
+            </div>
         </main>
 
-        {isIssuePanelOpen && (
+        <div className={isIssuePanelOpen ? 'slide-in-right' : 'slide-out-right'}>
+          {isIssuePanelOpen && (
           <IssuePanel 
             sessionId={sessionId} 
             annotations={annotations} 
@@ -1452,6 +1549,7 @@ const Dashboard: React.FC<DashboardProps> = ({ sessionId, slides, progress, anno
             }}
           />
         )}
+        </div>
       </div>
 
       {/* GAP-07: Prepare for Delivery Modal */}

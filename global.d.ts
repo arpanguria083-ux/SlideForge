@@ -11,6 +11,9 @@ declare global {
       getLogsPath?: () => Promise<string>;
       platform?: 'win32' | 'darwin' | 'linux';
       appVersion?: string;
+      onBackendPhase?: (cb: (msg: string) => void) => (() => void);
+      onBackendReady?: (cb: () => void) => void;
+      onBackendError?: (cb: (err: string) => void) => void;
     };
   }
 }

@@ -1,0 +1,166 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build and release Windows desktop app
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Code signing via GitHub Secrets:
+      #   CSC_LINK          — Base64-encoded PFX certificate (from GitHub repo secrets)
+      #   CSC_KEY_PASSWORD  — PFX password
+      # When these are set, electron-builder will sign all Windows executables.
+      # Without them, builds proceed unsigned (no SmartScreen trust).
+      # See SIGNING.md for details on setting up secrets.
+
+      - name: Extract version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "Extracted version: $version"
+
+      - name: Set package.json version
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $pkg.version = $version
+          $pkg | ConvertTo-Json -Depth 32 | Set-Content package.json
+          echo "package.json version set to $version"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install backend deps
+        run: uv sync --frozen --project backend --all-extras
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # --- Build once, use for all packaging variants ---
+      - name: Build renderer
+        run: npm run build:renderer
+
+      - name: Build Electron main/preload
+        run: npm run build:electron
+
+      - name: Build packaged backend
+        run: pwsh backend/build_and_package.ps1 -SkipFrontendBuild
+
+      - name: Smoke-test backend EXE
+        run: pwsh scripts/smoke-backend-exe.ps1 -ExePath "backend/dist-package/SlideForge/SlideForge.exe"
+
+      # --- Package variant 1: NSIS installer (full with models) ---
+      - name: Build NSIS installer (full)
+        run: npx electron-builder --win nsis --config electron-builder.yml
+
+      # --- Package variant 2: ZIP bundle (full with models, env-aware) ---
+      - name: Build ZIP bundle (full)
+        shell: pwsh
+        run: npm run package:full
+
+      # --- Package variant 3: Lite NSIS + portable (no bundled models) ---
+      - name: Build Lite (NSIS + portable)
+        shell: pwsh
+        run: |
+          pwsh backend/build_and_package.ps1 -SkipFrontendBuild -SkipModelBundle
+          npx electron-builder --win --config electron-builder.lite.yml
+
+      - name: List release artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path release/ -Recurse -Include "*.exe","*.zip" | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload NSIS installer (full)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlideForge-AI-Installer-Win-x64
+          path: release/electron/*.exe
+          if-no-files-found: error
+
+      - name: Upload ZIP bundle (full)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlideForge-AI-Full-Win-x64
+          path: release/electron-full-zip-*/*.zip
+          if-no-files-found: warn
+
+      - name: Upload Lite builds
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlideForge-AI-Lite-Win-x64
+          path: release/electron-lite/*.exe
+          if-no-files-found: warn
+
+      # --- Create GitHub Release ---
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = "${{ steps.version.outputs.version }}"
+
+          $body = @"
+          # SlideForge AI $version for Windows
+
+          ## Downloads
+
+          ### SlideForge AI (Full)
+          - **NSIS Installer** — Recommended for most users. Includes bundled models.
+          - **Full ZIP** — Portable bundle with all models included. No installation needed.
+
+          ### SlideForge AI Lite
+          - **Lite NSIS Installer** — For users who already have models, or prefer to download on first run.
+          - **Lite Portable** — Standalone executable, no installation required. Models download on first use.
+
+          ## System Requirements
+          - Windows 10 or later (64-bit)
+          - 8 GB RAM (16 GB recommended)
+          - 4 GB free disk space (with bundled models)
+
+          ## Installation
+          1. Download the NSIS installer (recommended) or ZIP bundle
+          2. Run the installer or extract the ZIP
+          3. Launch SlideForge AI
+          "@
+
+          gh release create "$tag" `
+            --title "SlideForge AI $version" `
+            --notes "$body" `
+            --draft
+
+          $artifacts = @()
+          $artifacts += Get-ChildItem -Path "release/electron/*.exe" -ErrorAction SilentlyContinue
+          $artifacts += Get-ChildItem -Path "release/electron-full-zip-*/*.zip" -ErrorAction SilentlyContinue
+          $artifacts += Get-ChildItem -Path "release/electron-lite/*.exe" -ErrorAction SilentlyContinue
+
+          foreach ($artifact in $artifacts) {
+            Write-Host "Uploading $($artifact.FullName)..."
+            gh release upload "$tag" "$($artifact.FullName)" --clobber
+          }
+
+          Write-Host "Release $tag created as draft with $($artifacts.Count) artifacts"

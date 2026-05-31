@@ -1,0 +1,37 @@
+appId: com.slideforge.ai.got
+productName: SlideForge AI GOT-OCR
+copyright: Copyright © 2026 SlideForge
+directories:
+  output: release/electron-got
+  buildResources: buildResources
+files:
+  - dist/**
+  - '!dist/electron/**'
+  - dist-electron/**
+  - legal/**
+extraResources:
+  - from: backend/dist-package/SlideForge
+    to: backend
+    filter:
+      - "**/*"
+      - "!**/*.dist-info/licenses/**"
+      - "!**/*.pyc"
+      - "!**/__pycache__/**"
+win:
+  target:
+    - target: nsis
+    - target: portable
+mac:
+  target: dmg
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: SlideForge AI GOT-OCR
+  warningsAsErrors: false
+  license: legal/OPEN_SOURCE_INSTALLER_AGREEMENT.txt
+portable:
+  artifactName: ${productName}-${version}-portable.exe
+asar: false

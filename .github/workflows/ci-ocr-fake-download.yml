@@ -1,0 +1,29 @@
+name: CI — OCR fake-download
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ocr-fake-download:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt || true
+          pip install huggingface_hub
+      - name: Run fake download + verify
+        working-directory: backend
+        env:
+          SLIDEFORGE_OCR_FAKE_DOWNLOAD: '1'
+        run: |
+          python -u scripts/update_manifest_hashes.py
+          python -u scripts/inproc_verify_and_warmup.py

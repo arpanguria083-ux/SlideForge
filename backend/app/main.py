@@ -1,3 +1,8 @@
+import sys
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -6,8 +11,10 @@ from fastapi import (
     BackgroundTasks,
     Header,
     Depends,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,11 +31,15 @@ import logging
 import threading
 import time
 import asyncio
+import copy
+import socket
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
+# Lightweight core imports only — heavy ML/DB imports are deferred to first use
 from app.models.schemas import (
     GuardrailSchema,
     QAScorecard,
@@ -37,22 +48,6 @@ from app.models.schemas import (
     AcceptRequest,
     SignRequest,
     SaveTemplateRequest,
-)
-from app.services.document_ingestion import DocumentIngestionService
-from app.services.guardrail import GuardrailManager
-from app.services.adaptation_loop import adaptation_agent
-from app.agents.parallel_analysis import (
-    ParallelAnalysisOrchestrator,
-    QAGradingOrchestrator,
-    RevisionOrchestrator,
-)
-from app.agents.language_analysis import LanguageAnalysisAgent
-from app.agents.template_discovery import template_discovery_agent
-from app.services.audit_log import audit_log_service
-from app.services.claim_evidence import ChromaDBManager, ClaimEvidenceGuardrail
-from app.services.analysis_history import (
-    AnalysisHistoryStore,
-    ANALYSIS_HISTORY_VERSION,
 )
 from app.services.llm_inference import (
     InferenceProvider,
@@ -65,8 +60,14 @@ from app.services.model_registry import model_registry
 from app.core.session_store import SQLiteSessionStore
 from app.api import api_router
 from app.core.config import AppSettings
-from app.core.request_id import request_id_middleware
+from app.core.request_id import request_id_ctx, request_id_middleware
 from app.core.time_utils import utc_now_compact, utc_now_iso
+
+# These are imported lazily in ensure_services_loaded() to avoid blocking startup:
+# DocumentIngestionService, GuardrailManager, adaptation_agent,
+# ParallelAnalysisOrchestrator, QAGradingOrchestrator, RevisionOrchestrator,
+# LanguageAnalysisAgent, template_discovery_agent, audit_log_service,
+# ChromaDBManager, ClaimEvidenceGuardrail, AnalysisHistoryStore
 
 
 # Configure structured logging
@@ -92,6 +93,55 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(RedactingFilter())
 
 settings = AppSettings()
+data_dir = Path(settings.data_dir)
+analysis_history_store = None
+guardrail_manager = None
+chroma_manager = None
+claim_evidence_guardrail = None
+session_store = None
+ingestion_service = None
+analysis_orchestrator = None
+qa_grader = None
+revision_orchestrator = None
+language_agent = None
+
+_process_started_at = time.time()
+_background_warmup_task: Optional[asyncio.Task] = None
+_startup_state_lock = threading.Lock()
+_startup_state = {
+    "app_ready_at": None,
+    "preflight": {
+        "overall": "UNKNOWN",
+        "checks": [],
+        "timestamp": None,
+    },
+    "model_warmup_state": "idle",
+    "model_warmup_message": "Model warmup has not started.",
+    "model_warmup_started_at": None,
+    "model_warmup_finished_at": None,
+    "model_warmup_error": None,
+}
+
+_analysis_runtime = {
+    "last_run_at": None,
+    "last_status": "idle",
+    "last_session_id": None,
+    "last_error": None,
+}
+
+
+def init_state(base_data_dir: Path | str) -> None:
+    """Lightweight startup init — only SQLite session store, no heavy ML/DB imports."""
+    global data_dir, session_store
+
+    data_dir = Path(base_data_dir).expanduser().resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    settings.data_dir = str(data_dir)
+
+    session_store = SQLiteSessionStore(str(data_dir / "sessions.db"))
+
+
+init_state(settings.data_dir)
 
 
 @asynccontextmanager
@@ -107,6 +157,26 @@ app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 app.include_router(api_router)
 app.middleware("http")(request_id_middleware)
 _service_load_lock = threading.Lock()
+
+# Lazy singleton accessors — avoid module-level heavy imports
+_audit_log_service = None
+_adaptation_agent = None
+
+
+def _get_audit_log():
+    global _audit_log_service
+    if _audit_log_service is None:
+        from app.services.audit_log import audit_log_service as _svc
+        _audit_log_service = _svc
+    return _audit_log_service
+
+
+def _get_adaptation_agent():
+    global _adaptation_agent
+    if _adaptation_agent is None:
+        from app.services.adaptation_loop import adaptation_agent as _ag
+        _adaptation_agent = _ag
+    return _adaptation_agent
 
 
 class RuntimeProviderConfigPayload(BaseModel):
@@ -215,6 +285,261 @@ def _extract_provider_updates(
     return updates or None
 
 
+def _request_id_value() -> Optional[str]:
+    try:
+        value = request_id_ctx.get()
+        return value or None
+    except Exception:
+        return None
+
+
+def _set_startup_state(**updates) -> None:
+    with _startup_state_lock:
+        _startup_state.update(updates)
+
+
+def _set_model_warmup_state(
+    phase: str,
+    message: str,
+    *,
+    error: Optional[str] = None,
+    started_at: Optional[float] = None,
+    finished_at: Optional[float] = None,
+) -> None:
+    payload = {
+        "model_warmup_state": phase,
+        "model_warmup_message": message,
+        "model_warmup_error": error,
+    }
+    if started_at is not None:
+        payload["model_warmup_started_at"] = started_at
+    if finished_at is not None:
+        payload["model_warmup_finished_at"] = finished_at
+    _set_startup_state(**payload)
+
+
+def _llm_provider_runtime_hint(provider: str, base_url: str) -> str:
+    if provider == InferenceProvider.LM_STUDIO.value:
+        host_hint = base_url or "http://127.0.0.1:1234/v1"
+        return (
+            f"Start LM Studio server and verify the endpoint {host_hint}. "
+            "In LM Studio: Developer tab -> Start Server."
+        )
+    if provider == InferenceProvider.OLLAMA.value:
+        return (
+            "Start Ollama and make sure the model exists. "
+            "Try: `ollama serve` and `ollama pull <model>`.")
+    if provider == InferenceProvider.API.value:
+        return (
+            "Verify API base URL and API key in settings, then test again."
+        )
+    return "Verify provider settings and retry the connection test."
+
+
+def _llm_connection_error_detail(error: Exception) -> tuple[str, str]:
+    message = str(error or "Connection test failed").strip() or "Connection test failed"
+    lowered = message.lower()
+    if "connection refused" in lowered or "[winerror 10061]" in lowered:
+        return (
+            "Could not connect to the configured LLM endpoint.",
+            "The endpoint refused the TCP connection. Check that the local model server is running on the configured host and port.",
+        )
+    if "timed out" in lowered or "timeout" in lowered:
+        return (
+            "LLM endpoint timed out during connection test.",
+            "The server did not respond in time. Check model load state and server health, then retry.",
+        )
+    if "401" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+        return (
+            "LLM endpoint rejected authentication.",
+            "Check credentials and authentication settings for the selected provider.",
+        )
+    if "404" in lowered:
+        return (
+            "LLM endpoint path was not found.",
+            "Use an OpenAI-compatible base URL that exposes `/chat/completions`.",
+        )
+    return (
+        "LLM connection test failed.",
+        "Review provider settings and backend logs, then retry.",
+    )
+
+
+def _safe_disk_status(path: Path) -> dict:
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "ok": True,
+            "total_bytes": int(usage.total),
+            "used_bytes": int(usage.used),
+            "free_bytes": int(usage.free),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+        }
+
+
+def _safe_memory_status() -> dict:
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        proc = psutil.Process(os.getpid())
+        return {
+            "ok": True,
+            "used_bytes": int(vm.used),
+            "total_bytes": int(vm.total),
+            "process_rss_bytes": int(proc.memory_info().rss),
+            "percent": float(vm.percent),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+        }
+
+
+def _socket_probe(base_url: str) -> dict:
+    parsed = urlparse(base_url or "")
+    host = parsed.hostname or "127.0.0.1"
+    if parsed.port:
+        port = parsed.port
+    elif parsed.scheme == "https":
+        port = 443
+    else:
+        port = 80
+
+    started = time.perf_counter()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.5)
+            ok = sock.connect_ex((host, port)) == 0
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return {
+            "ok": ok,
+            "host": host,
+            "port": port,
+            "latency_ms": latency_ms,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "port": port,
+            "error": str(exc),
+        }
+
+
+def _is_local_host(host: Optional[str]) -> bool:
+    if not host:
+        return False
+    normalized = host.strip().lower()
+    if normalized in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if normalized.startswith("127."):
+        return True
+    return False
+
+
+def _safe_chroma_status() -> dict:
+    if chroma_manager is None:
+        return {
+            "state": "not_initialized",
+            "collections": None,
+        }
+    try:
+        collections = chroma_manager.client.list_collections()
+        return {
+            "state": "initialized",
+            "collections": len(collections),
+        }
+    except Exception as exc:
+        return {
+            "state": "error",
+            "collections": None,
+            "error": str(exc),
+        }
+
+
+def _safe_last_analysis_status() -> dict:
+    with _startup_state_lock:
+        return dict(_analysis_runtime)
+
+
+def _safe_startup_state_snapshot() -> dict:
+    with _startup_state_lock:
+        return copy.deepcopy(_startup_state)
+
+
+def _structured_error_detail(
+    *,
+    status_code: int,
+    code: str,
+    title: str,
+    message: str,
+    hint: str,
+    endpoint: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> dict:
+    context = {
+        "requestId": _request_id_value(),
+        "timestamp": utc_now_iso(),
+        "endpoint": endpoint,
+        "status": status_code,
+    }
+    if provider:
+        context["provider"] = provider
+    if base_url:
+        context["base_url"] = base_url
+    if model:
+        context["model"] = model
+    if details:
+        context["details"] = details
+
+    return {
+        "code": code,
+        "title": title,
+        "message": message,
+        "hint": hint,
+        "context": context,
+    }
+
+
+def _structured_http_exception(
+    *,
+    status_code: int,
+    code: str,
+    title: str,
+    message: str,
+    hint: str,
+    endpoint: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=_structured_error_detail(
+            status_code=status_code,
+            code=code,
+            title=title,
+            message=message,
+            hint=hint,
+            endpoint=endpoint,
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            details=details,
+        ),
+    )
+
+
 def _enforce_upload_size(content: bytes) -> None:
     max_size = int(settings.max_file_size)
     if len(content) > max_size:
@@ -229,7 +554,40 @@ def ensure_services_loaded():
     global qa_grader, revision_orchestrator, language_agent
     global chroma_manager, claim_evidence_guardrail, analysis_history_store
 
-    if all(
+    if _heavy_services_ready():
+        return
+
+    with _service_load_lock:
+        if _heavy_services_ready():
+            return
+
+        # Lazy imports — only executed once on first real request
+        from app.services.document_ingestion import DocumentIngestionService
+        from app.services.guardrail import GuardrailManager
+        from app.services.adaptation_loop import adaptation_agent as _adaptation_agent
+        from app.agents.parallel_analysis import (
+            ParallelAnalysisOrchestrator,
+            QAGradingOrchestrator,
+            RevisionOrchestrator,
+        )
+        from app.agents.language_analysis import LanguageAnalysisAgent
+        from app.services.claim_evidence import ChromaDBManager, ClaimEvidenceGuardrail
+        from app.services.analysis_history import AnalysisHistoryStore
+
+        ingestion_service = DocumentIngestionService()
+        guardrail_manager = GuardrailManager(str(data_dir / "guardrails"))
+        analysis_orchestrator = ParallelAnalysisOrchestrator()
+        qa_grader = QAGradingOrchestrator()
+        revision_orchestrator = RevisionOrchestrator()
+        language_agent = LanguageAnalysisAgent()
+        chroma_manager = ChromaDBManager(str(data_dir / "chromadb"))
+        claim_evidence_guardrail = ClaimEvidenceGuardrail(chroma_manager)
+        analysis_history_store = AnalysisHistoryStore(str(data_dir / "analysis_history"))
+        logging.info("Lazy-loaded heavy ML/DB services on first request.")
+
+
+def _heavy_services_ready() -> bool:
+    return all(
         service is not None
         for service in (
             ingestion_service,
@@ -242,54 +600,66 @@ def ensure_services_loaded():
             claim_evidence_guardrail,
             analysis_history_store,
         )
-    ):
-        return
+    )
 
-    with _service_load_lock:
-        if all(
-            service is not None
-            for service in (
-                ingestion_service,
-                guardrail_manager,
-                analysis_orchestrator,
-                qa_grader,
-                revision_orchestrator,
-                language_agent,
-                chroma_manager,
-                claim_evidence_guardrail,
-                analysis_history_store,
-            )
-        ):
-            return
 
-        ingestion_service = DocumentIngestionService()
-        guardrail_manager = GuardrailManager(str(data_dir / "guardrails"))
-        analysis_orchestrator = ParallelAnalysisOrchestrator()
-        qa_grader = QAGradingOrchestrator()
-        revision_orchestrator = RevisionOrchestrator()
-        language_agent = LanguageAnalysisAgent()
-
-        chroma_manager = ChromaDBManager(str(data_dir / "chromadb"))
-        claim_evidence_guardrail = ClaimEvidenceGuardrail(chroma_manager)
-        analysis_history_store = AnalysisHistoryStore(
-            str(data_dir / "analysis_history")
+async def _lazy_load_models() -> None:
+    started_at = time.time()
+    _set_model_warmup_state(
+        "loading",
+        "Loading OCR and analysis models in the background.",
+        error=None,
+        started_at=started_at,
+        finished_at=None,
+    )
+    try:
+        await asyncio.to_thread(ensure_services_loaded)
+        # Warmup active OCR backend predictors so first analysis doesn't pay model-load latency
+        from app.services.model_registry import model_registry
+        warmup_result = await asyncio.to_thread(model_registry.warmup_ocr_backend)
+        logger.info("OCR warmup result: %s", warmup_result)
+        _set_model_warmup_state(
+            "ready",
+            "Background model warmup completed.",
+            error=None,
+            started_at=started_at,
+            finished_at=time.time(),
         )
-        logging.info("Lazy-loaded heavy ML models and services.")
+    except Exception as exc:
+        logger.exception("Background model warmup failed")
+        _set_model_warmup_state(
+            "error",
+            "Background model warmup failed.",
+            error=str(exc),
+            started_at=started_at,
+            finished_at=time.time(),
+        )
 
 
 async def startup_event():
+    global _background_warmup_task
     recovered = session_store.mark_stale_inflight_failed(stale_seconds=60)
     if recovered:
         logger.warning("Recovered %s stale in-flight sessions as failed", recovered)
     active_sessions.update(session_store.list_active(_session_ttl_seconds()))
-    asyncio.create_task(asyncio.to_thread(ensure_services_loaded))
     asyncio.create_task(_cleanup_expired_sessions_loop())
     from app.core.preflight import run_preflight_checks
 
     results = run_preflight_checks(data_dir=str(settings.data_dir))
+    _set_startup_state(
+        preflight={
+            "overall": results.get("overall", "UNKNOWN"),
+            "checks": results.get("checks", []),
+            "timestamp": results.get("timestamp"),
+        }
+    )
     for check in results["checks"]:
         if check["status"] != "OK":
             logging.warning(f"[PREFLIGHT] {check['name']}: {check['message']}")
+    _set_startup_state(app_ready_at=time.time())
+    if _background_warmup_task is None or _background_warmup_task.done():
+        _background_warmup_task = asyncio.create_task(_lazy_load_models())
+    logger.info("APP_READY")
 
 
 cors_origins = os.environ.get(
@@ -303,22 +673,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-data_dir = Path(settings.data_dir)
-data_dir.mkdir(parents=True, exist_ok=True)
-
-ingestion_service = None
-guardrail_manager = None
-analysis_orchestrator = None
-qa_grader = None
-revision_orchestrator = None
-language_agent = None
-chroma_manager = None
-claim_evidence_guardrail = None
-analysis_history_store = None
-
-
 active_sessions = {}
-session_store = SQLiteSessionStore(str(data_dir / "sessions.db"))
+session_locks: dict[str, asyncio.Lock] = {}
+analysis_jobs: dict[str, dict] = {}
 _cleanup_stats_lock = threading.Lock()
 _cleanup_stats = {
     "last_run_ts": None,
@@ -332,11 +689,54 @@ def _touch_session(session: dict):
     session["last_access_ts"] = time.time()
 
 
+def _session_snapshot(session_id: str, session: Optional[dict]) -> dict:
+    if not isinstance(session, dict):
+        return {
+            "session_id": session_id,
+            "exists": False,
+        }
+    return {
+        "session_id": session_id,
+        "exists": True,
+        "status": session.get("status"),
+        "deck_path": session.get("deck_path"),
+        "has_slides": bool(session.get("slides_data")),
+        "slide_count": len(session.get("slides_data") or []),
+        "has_scorecard": bool(session.get("scorecard")),
+        "history_restored": bool(session.get("history_restored")),
+        "source_files": list(session.get("source_files") or []),
+        "has_excel": bool(session.get("excel_data")),
+        "last_access_ts": session.get("last_access_ts"),
+    }
+
+
+def _log_session_event(event: str, session_id: str, **extra) -> None:
+    payload = {
+        "event": event,
+        "pid": os.getpid(),
+        "data_dir": str(data_dir),
+        "active_sessions": len(active_sessions),
+        **extra,
+    }
+    logger.info("SESSION_EVENT %s %s", session_id, json.dumps(payload, default=str))
+
+
 def _persist_session(session_id: str, session: dict):
     try:
         session_store.save(session_id, session)
     except Exception:
         logger.exception("Failed to persist session %s", session_id)
+
+
+def _touch_session_metadata(session_id: str, session: dict) -> None:
+    try:
+        session_store.touch(
+            session_id,
+            last_accessed=float(session.get("last_access_ts") or time.time()),
+            status=str(session.get("status") or "created"),
+        )
+    except Exception:
+        logger.exception("Failed to touch session %s", session_id)
 
 
 def _namespace_key(client_namespace: Optional[str]) -> str:
@@ -358,17 +758,66 @@ def _is_session_expired(session: dict, now_ts: float, ttl_seconds: int) -> bool:
 
 
 def _get_session_or_404(session_id: str) -> dict:
+    ttl_seconds = _session_ttl_seconds()
+    now_ts = time.time()
     session = active_sessions.get(session_id)
+    if session is not None and _is_session_expired(session, now_ts, ttl_seconds):
+        _log_session_event(
+            "expired_in_memory",
+            session_id,
+            snapshot=_session_snapshot(session_id, session),
+        )
+        active_sessions.pop(session_id, None)
+        _cleanup_session_artifacts(session_id, session)
+        _clear_analysis_job(session_id)
+        session_store.delete(session_id)
+        session_locks.pop(session_id, None)
+        session = None
     if session is None:
-        restored = session_store.load(session_id)
+        restored = session_store.load(session_id, ttl_seconds=ttl_seconds)
         if restored is not None:
             active_sessions[session_id] = restored
             session = restored
+            _log_session_event(
+                "restored_from_store",
+                session_id,
+                snapshot=_session_snapshot(session_id, session),
+            )
     if session is None:
+        _log_session_event(
+            "lookup_failed",
+            session_id,
+            known_session_ids=list(active_sessions.keys())[:20],
+        )
         raise HTTPException(status_code=404, detail="Session not found")
     _touch_session(session)
-    _persist_session(session_id, session)
+    _touch_session_metadata(session_id, session)
     return session
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    lock = session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        session_locks[session_id] = lock
+    return lock
+
+
+def _get_analysis_job(session_id: str) -> Optional[dict]:
+    return analysis_jobs.get(session_id)
+
+
+def _set_analysis_job(session_id: str, **updates) -> dict:
+    job = analysis_jobs.get(session_id, {})
+    job.update(updates)
+    job.setdefault("session_id", session_id)
+    job["updated_at"] = time.time()
+    analysis_jobs[session_id] = job
+    return job
+
+
+def _clear_analysis_job(session_id: str) -> None:
+    analysis_jobs.pop(session_id, None)
 
 
 def _cleanup_session_artifacts(session_id: str, session: dict):
@@ -480,6 +929,9 @@ def _collect_expired_session_ids(now_ts: Optional[float] = None) -> list[str]:
 
 def _evict_expired_sessions_now(now_ts: Optional[float] = None) -> list[str]:
     expired_ids = _collect_expired_session_ids(now_ts)
+    expired_ids.extend(
+        sid for sid in session_store.delete_expired(_session_ttl_seconds()) if sid not in expired_ids
+    )
     if not expired_ids:
         _record_cleanup_stats([])
         return []
@@ -488,7 +940,10 @@ def _evict_expired_sessions_now(now_ts: Optional[float] = None) -> list[str]:
         session = active_sessions.pop(sid, None)
         if session is not None:
             _cleanup_session_artifacts(sid, session)
-        session_store.delete(sid)
+        else:
+            session_store.delete(sid)
+        _clear_analysis_job(sid)
+        session_locks.pop(sid, None)
 
     _record_cleanup_stats(expired_ids)
     logger.info("Expired %s inactive session(s): %s", len(expired_ids), expired_ids)
@@ -537,7 +992,8 @@ async def _cleanup_expired_sessions_loop():
 
 
 def _clamp_percent(value: float) -> float:
-    return max(0.0, min(100.0, value))
+    """Clamp negative values to 0, but allow values >100 for overlays that extend beyond slide."""
+    return max(0.0, value)  # Only clamp negative, allow overflow for edge-touching elements
 
 
 def _deterministic_band_index(text: str, modulo: int = 6) -> int:
@@ -609,6 +1065,7 @@ def _clone_slide_payloads_for_session(
 def _history_entry_is_current(history_entry: Optional[dict]) -> bool:
     if not history_entry:
         return False
+    from app.services.analysis_history import ANALYSIS_HISTORY_VERSION
     if int(history_entry.get("analysis_version", 0)) < ANALYSIS_HISTORY_VERSION:
         return False
     deep_analysis = history_entry.get("deep_analysis_by_slide", {})
@@ -793,7 +1250,7 @@ def _build_deep_analysis_by_slide(
 # ---------------------------------------------------------------------------
 # Scoring functions — delegated to services.scoring module
 # ---------------------------------------------------------------------------
-from .services.scoring import (
+from app.services.scoring import (
     build_slide_consultant_score as _build_slide_consultant_score,
     build_slide_reliability as _build_slide_reliability,
 )
@@ -816,8 +1273,31 @@ def _invalidate_session_analysis(session: dict) -> None:
     session.pop("deep_analysis_by_slide", None)
     session.pop("agent_metadata", None)
     session.pop("auto_fixes", None)
+    session.pop("history_restored_at", None)
     session["history_restored"] = False
     session["status"] = "parsed"
+
+
+def _reset_session_for_new_deck(session: dict) -> None:
+    source_namespace = session.get("source_namespace")
+    session["slides_data"] = []
+    session.pop("deck_metadata", None)
+    session.pop("document_fingerprint", None)
+    session.pop("history_available", None)
+    session.pop("original_filename", None)
+    session.pop("senior_signed", None)
+    session.pop("senior_name", None)
+    _invalidate_session_analysis(session)
+    session["status"] = "created"
+    if source_namespace and chroma_manager is not None:
+        try:
+            chroma_manager.delete_collection(source_namespace)
+        except Exception:
+            logger.exception("Failed to reset Chroma namespace for deck refresh")
+    session["source_namespace"] = None
+    session["source_files"] = []
+    session["source_indexed_chunks"] = {}
+    session["excel_data"] = None
 
 
 def _session_id_by_ref(session: dict) -> Optional[str]:
@@ -902,6 +1382,103 @@ def _remove_annotation_from_deep_analysis(session: dict, annotation_id: str) -> 
     session["deep_analysis_by_slide"] = deep
 
 
+def _auto_tune_guardrail(guardrail, annotations: list) -> None:
+    """Track dimension scores from completed analysis for guardrail weight auto-tuning.
+
+    Extracts per-dimension scores from analysis annotations and feeds them
+    into the adaptation_agent for historical tracking and eventual weight adjustment.
+    """
+    if not annotations:
+        return
+
+    # Compute per-dimension scores based on annotation severity
+    dimension_scores: dict[str, float] = {}
+    dim_annotations: dict[str, list[int]] = {}
+
+    for ann in annotations:
+        cat = (ann.get("category") or "").lower()
+        severity = ann.get("severity", "")
+        if not cat:
+            continue
+
+        # Map annotation category to tuning dimension
+        dim = cat
+        if cat in {"grammar", "tone", "hedging", "quality"}:
+            dim = "language"
+        elif cat in {"claim_extraction", "claim_grounding"}:
+            dim = "claim_grounding"
+        elif cat in {"excel-lineage"}:
+            dim = "data_accuracy"
+
+        # Convert severity to score
+        if severity == "hard_block":
+            score = 0.0
+        elif severity == "warning":
+            score = 50.0
+        else:
+            score = 100.0
+
+        dim_annotations.setdefault(dim, []).append(int(score))
+
+    if not dim_annotations:
+        return
+
+    # Average scores per dimension
+    for dim, scores in dim_annotations.items():
+        dimension_scores[dim] = sum(scores) / len(scores)
+
+    # Get current weights from guardrail
+    weights = guardrail.normalized_rubric_weights()
+
+    # Track scores for auto-tuning
+    agent = _get_adaptation_agent()
+    agent.track_dimension_scores(str(guardrail.engagement_type or "strategy"), dimension_scores, weights)
+
+
+def _compute_coverage_dimension_penalties(
+    guardrail_coverage: list[dict],
+) -> dict[str, float]:
+    """Compute per-dimension penalty (0.0-1.0) from failed coverage items.
+
+    Failed items in coverage suppress their corresponding dimension score
+    so the overall score more accurately reflects actual compliance.
+    """
+    dimension_map: dict[str, set[str]] = {
+        "structure": {"structure", "layout", "framework"},
+        "claim_grounding": {"claim_grounding", "claim_extraction"},
+        "data_accuracy": {"data_accuracy", "benchmarking", "excel-lineage"},
+        "visual": {"visual"},
+        "language": {"language", "grammar", "tone", "hedging"},
+        "framework": {"framework"},
+        "so_what": {"so_what"},
+        "benchmarking": {"benchmarking", "data_accuracy"},
+    }
+
+    total_per_dim: dict[str, int] = {}
+    failed_per_dim: dict[str, int] = {}
+
+    for item in guardrail_coverage:
+        source = (item.get("source") or "").lower()
+        status = item.get("status", "")
+        for dim, keywords in dimension_map.items():
+            if any(kw in source for kw in keywords):
+                total_per_dim[dim] = total_per_dim.get(dim, 0) + 1
+                if status == "failed":
+                    failed_per_dim[dim] = failed_per_dim.get(dim, 0) + 1
+                break
+
+    penalties: dict[str, float] = {}
+    for dim in dimension_map:
+        total = total_per_dim.get(dim, 0)
+        failed = failed_per_dim.get(dim, 0)
+        if total > 0:
+            penalties[dim] = min(1.0, failed / total)
+        else:
+            penalties[dim] = 0.0
+
+    return penalties
+
+
 def _build_dynamic_slide_scorecard(
     guardrail: GuardrailSchema,
     consultant_score: dict,
@@ -924,15 +1501,17 @@ def _build_dynamic_slide_scorecard(
     so_what_score = float(so_what_meta.get("score", msg) or msg)
     benchmark_score = float(benchmark_meta.get("score", evd) or evd)
 
+    coverage_penalties = _compute_coverage_dimension_penalties(guardrail_coverage)
+
     dimension_scores: dict[str, float] = {
-        "structure": round(max(0.0, min(100.0, (msg * 0.7 + layout * 0.3))), 2),
-        "claim_grounding": round(max(0.0, min(100.0, evd)), 2),
-        "data_accuracy": round(max(0.0, min(100.0, evd)), 2),
-        "visual": round(max(0.0, min(100.0, visual)), 2),
-        "language": round(max(0.0, min(100.0, msg)), 2),
-        "framework": round(max(0.0, min(100.0, framework_score)), 2),
-        "so_what": round(max(0.0, min(100.0, so_what_score)), 2),
-        "benchmarking": round(max(0.0, min(100.0, benchmark_score)), 2),
+        "structure": round(max(0.0, min(100.0, (msg * 0.7 + layout * 0.3) * (1.0 - coverage_penalties.get("structure", 0.0)))), 2),
+        "claim_grounding": round(max(0.0, min(100.0, evd * (1.0 - coverage_penalties.get("claim_grounding", 0.0)))), 2),
+        "data_accuracy": round(max(0.0, min(100.0, evd * (1.0 - coverage_penalties.get("data_accuracy", 0.0)))), 2),
+        "visual": round(max(0.0, min(100.0, visual * (1.0 - coverage_penalties.get("visual", 0.0)))), 2),
+        "language": round(max(0.0, min(100.0, msg * (1.0 - coverage_penalties.get("language", 0.0)))), 2),
+        "framework": round(max(0.0, min(100.0, framework_score * (1.0 - coverage_penalties.get("framework", 0.0)))), 2),
+        "so_what": round(max(0.0, min(100.0, so_what_score * (1.0 - coverage_penalties.get("so_what", 0.0)))), 2),
+        "benchmarking": round(max(0.0, min(100.0, benchmark_score * (1.0 - coverage_penalties.get("benchmarking", 0.0)))), 2),
     }
 
     overall = _weighted_dimension_score(dimension_scores, weights)
@@ -1287,11 +1866,28 @@ async def _refresh_single_slide_deep_analysis(session: dict, slide_index: int) -
 
 
 def _element_box_to_percent(element: dict, slide: dict) -> dict:
-    unit = (element.get("coord_unit") or "percent").lower()
+    unit = element.get("coord_unit")
     x = float(element.get("x", 0) or 0)
     y = float(element.get("y", 0) or 0)
     width = float(element.get("width", 0) or 0)
     height = float(element.get("height", 0) or 0)
+
+    if not unit:
+        # Smart fallback for native elements lacking coord_unit (stored in absolute Inches)
+        # e.g. "img_1_2", "tbl_2_3", or chart_id / table_id structures
+        has_native_id = any(
+            isinstance(element.get("id"), str) and element.get("id").startswith(prefix)
+            for prefix in ("img_", "tbl_", "tb_", "page_")
+        ) or "chart_id" in element or "table_id" in element
+        
+        # If coordinates resemble small absolute Inch measurements (< 30) instead of raw 0-100% ratios,
+        # treat as absolute
+        if has_native_id or (x < 30.0 and y < 30.0 and (x > 0 or y > 0 or width > 0 or height > 0)):
+            unit = "absolute"
+        else:
+            unit = "percent"
+    else:
+        unit = unit.lower()
 
     if unit == "absolute":
         slide_w = float(slide.get("width", 0) or 0)
@@ -1299,15 +1895,15 @@ def _element_box_to_percent(element: dict, slide: dict) -> dict:
         return {
             "top": _clamp_percent((y / slide_h) * 100 if slide_h > 0 else 0),
             "left": _clamp_percent((x / slide_w) * 100 if slide_w > 0 else 0),
-            "width": _clamp_percent((width / slide_w) * 100 if slide_w > 0 else 0),
-            "height": _clamp_percent((height / slide_h) * 100 if slide_h > 0 else 0),
+            "width": _clamp_percent((width / slide_w) * 100 if slide_w > 0 else 0) if slide_w > 0 else 0,
+            "height": _clamp_percent((height / slide_h) * 100 if slide_h > 0 else 0) if slide_h > 0 else 0,
         }
 
     return {
         "top": _clamp_percent(y),
         "left": _clamp_percent(x),
-        "width": _clamp_percent(width),
-        "height": _clamp_percent(height),
+        "width": max(0.0, width),  # Allow width to extend beyond 100%, don't clamp
+        "height": max(0.0, height),  # Allow height to extend beyond 100%, don't clamp
     }
 
 
@@ -1442,53 +2038,158 @@ app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
 
 async def health_check():
-    ensure_services_loaded()
+    startup = _safe_startup_state_snapshot()
+    preflight = startup.get("preflight", {})
+    warmup_state = startup.get("model_warmup_state", "idle")
 
-    lt_status = await language_agent.lt_client.status()
-    grammar_available = bool(lt_status.get("available", False))
-    llm_available = inference_service.llm is not None
-    vision_backend = getattr(
-        getattr(analysis_orchestrator, "visual_agent", None),
-        "vision_backend",
-        "unknown",
-    )
-    chroma_ok = chroma_manager is not None and chroma_manager.client is not None
-    surya_layout_ready = model_registry.get_surya_layout() is not None
-    surya_recognition_ready = model_registry.get_surya_recognition() is not None
-    degraded = []
-    if not llm_available:
-        degraded.append("llm_unavailable")
-    if not grammar_available:
-        degraded.append("grammar_regex_fallback")
-    if vision_backend == "fallback":
-        degraded.append("vision_fallback")
-    if not surya_layout_ready:
-        degraded.append("layout_fallback")
-    if not surya_recognition_ready:
-        degraded.append("ocr_fallback")
-    if not chroma_ok:
-        degraded.append("evidence_store_unavailable")
+    degraded: list[str] = []
+    if preflight.get("overall") == "ERROR":
+        degraded.append("preflight_error")
+    if warmup_state == "error":
+        degraded.append("model_warmup_error")
 
     return {
         "status": "healthy" if not degraded else "degraded",
-        "offline_mode": True,
-        "components": {
-            "llm": llm_available,
-            "grammar": {
-                "available": grammar_available,
-                "base_url": language_agent.lt_client.base_url,
-                "last_error": lt_status.get("last_error"),
-            },
-            "vision": vision_backend,
-            "surya": {
-                "layout": surya_layout_ready,
-                "recognition": surya_recognition_ready,
-                "last_error": model_registry._surya_last_error,
-            },
-            "chroma": chroma_ok,
-        },
+        "timestamp": utc_now_iso(),
+        "pid": os.getpid(),
+        "uptime_seconds": int(max(0, time.time() - _process_started_at)),
+        "app_ready": bool(startup.get("app_ready_at")),
+        "model_warmup_state": warmup_state,
+        "preflight_overall": preflight.get("overall", "UNKNOWN"),
         "degraded_reasons": degraded,
     }
+
+
+async def get_diagnostics() -> dict:
+    startup = _safe_startup_state_snapshot()
+    warmup_task_running = (
+        _background_warmup_task is not None and not _background_warmup_task.done()
+    )
+
+    provider_snapshot = _runtime_provider_config_response()
+    current_provider = provider_snapshot.get("provider", inference_service.current_provider)
+
+    provider_details: dict[str, dict] = {}
+    for provider_name in (
+        InferenceProvider.API.value,
+        InferenceProvider.OLLAMA.value,
+        InferenceProvider.LM_STUDIO.value,
+    ):
+        provider_state = provider_snapshot.get("providers", {}).get(provider_name, {})
+        base_url = str(provider_state.get("base_url") or "")
+        parsed = urlparse(base_url or "")
+        provider_details[provider_name] = {
+            **provider_state,
+            "connection": _socket_probe(base_url) if base_url else {"ok": False},
+            "runtime_hint": _llm_provider_runtime_hint(provider_name, base_url),
+            "is_local": _is_local_host(parsed.hostname),
+        }
+
+    ocr_status = model_registry.get_runtime_status()
+    ocr_phase = str(ocr_status.get("phase") or "idle")
+    if ocr_phase in {"ready", "layout_ready", "recognition_ready", "foundation_ready"}:
+        ocr_state = "loaded"
+    elif ocr_phase in {"loading_layout", "loading_recognition", "loading_detector", "loading_foundation"}:
+        ocr_state = "loading"
+    elif ocr_phase == "error":
+        ocr_state = "error"
+    else:
+        ocr_state = "pending"
+
+    preflight = startup.get("preflight", {})
+    diagnostics_status = "ok"
+    if preflight.get("overall") == "ERROR" or ocr_state == "error":
+        diagnostics_status = "degraded"
+
+    return {
+        "status": diagnostics_status,
+        "timestamp": utc_now_iso(),
+        "request_id": _request_id_value(),
+        "backend": {
+            "status": "running",
+            "pid": os.getpid(),
+            "port": os.environ.get("PORT"),
+            "uptime_seconds": int(max(0, time.time() - _process_started_at)),
+            "app_ready": bool(startup.get("app_ready_at")),
+            "app_ready_at": startup.get("app_ready_at"),
+            "active_sessions": len(active_sessions),
+            "analysis_jobs": len(analysis_jobs),
+        },
+        "startup": {
+            "model_warmup_state": startup.get("model_warmup_state", "idle"),
+            "model_warmup_message": startup.get("model_warmup_message"),
+            "model_warmup_error": startup.get("model_warmup_error"),
+            "model_warmup_started_at": startup.get("model_warmup_started_at"),
+            "model_warmup_finished_at": startup.get("model_warmup_finished_at"),
+            "warmup_task_running": warmup_task_running,
+            "preflight": preflight,
+        },
+        "llm": {
+            "provider": current_provider,
+            "configured": bool(provider_snapshot.get("configured")),
+            "llm_available": inference_service.llm is not None,
+            "providers": provider_details,
+        },
+        "ocr": {
+            "state": ocr_state,
+            "phase": ocr_phase,
+            "message": ocr_status.get("message"),
+            "offline_ready": bool(ocr_status.get("offline_ready")),
+            "cache_dir": ocr_status.get("cache_dir"),
+            "cached_files": len(ocr_status.get("files") or []),
+            "last_error": ocr_status.get("last_error"),
+            "cooldown_active": bool(ocr_status.get("cooldown_active")),
+            "loaded": {
+                "layout": bool(ocr_status.get("layout_loaded")),
+                "recognition": bool(ocr_status.get("recognition_loaded")),
+                "detector": bool(ocr_status.get("detector_loaded")),
+                "foundation": bool(ocr_status.get("foundation_loaded")),
+            },
+        },
+        "chromadb": _safe_chroma_status(),
+        "system": {
+            "disk": _safe_disk_status(data_dir),
+            "memory": _safe_memory_status(),
+        },
+        "analysis": _safe_last_analysis_status(),
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict):
+        detail = dict(exc.detail)
+        context = detail.get("context")
+        if isinstance(context, dict):
+            if not context.get("requestId"):
+                context["requestId"] = _request_id_value()
+            if not context.get("timestamp"):
+                context["timestamp"] = utc_now_iso()
+            if not context.get("endpoint"):
+                context["endpoint"] = request.url.path
+            context.setdefault("status", exc.status_code)
+            detail["context"] = context
+        else:
+            detail["context"] = {
+                "requestId": _request_id_value(),
+                "timestamp": utc_now_iso(),
+                "endpoint": request.url.path,
+                "status": exc.status_code,
+            }
+        return JSONResponse(status_code=exc.status_code, content={"detail": detail})
+
+    if isinstance(exc.detail, str):
+        detail = _structured_error_detail(
+            status_code=exc.status_code,
+            code="HTTP_ERROR",
+            title="Request failed",
+            message=exc.detail,
+            hint="Check the request and retry.",
+            endpoint=request.url.path,
+        )
+        return JSONResponse(status_code=exc.status_code, content={"detail": detail})
+
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 async def get_session_metrics(
@@ -1590,6 +2291,7 @@ async def open_analysis_history(fingerprint: str):
 
     session_id = str(uuid.uuid4())
     now_ts = time.time()
+    session_locks[session_id] = asyncio.Lock()
     active_sessions[session_id] = {
         "client_namespace": None,
         "namespace_key": _namespace_key(None),
@@ -1624,6 +2326,7 @@ async def create_session(client_namespace: Optional[str] = None):
     now_ts = time.time()
     namespace_key = _namespace_key(client_namespace)
     _enforce_session_capacity(namespace_key)
+    session_locks[session_id] = asyncio.Lock()
 
     active_sessions[session_id] = {
         "client_namespace": client_namespace,
@@ -1646,6 +2349,12 @@ async def create_session(client_namespace: Optional[str] = None):
     }
 
     _persist_session(session_id, active_sessions[session_id])
+    _log_session_event(
+        "created",
+        session_id,
+        snapshot=_session_snapshot(session_id, active_sessions[session_id]),
+        client_namespace=client_namespace,
+    )
 
     return {"session_id": session_id}
 
@@ -1740,6 +2449,7 @@ def _guardrail_from_session(session: dict) -> GuardrailSchema:
             return GuardrailSchema(**raw_guardrail)
         except Exception:
             pass
+
     return GuardrailSchema(client_namespace=session.get("client_namespace"))
 
 
@@ -1794,6 +2504,92 @@ def _rule_categories_from_text(rule_text: str) -> set[str]:
         )
 
     return categories
+
+
+def _validate_language_rule_on_slide(
+    rule_key: str,
+    rule_value: object,
+    slide: dict,
+) -> tuple[bool, str]:
+    """Deterministic per-slide validation of a single language rule.
+
+    Returns (passed, detail_message) where passed=True means the slide
+    complies with the rule.
+    """
+    full_text = (slide.get("full_text") or "")
+    title = (slide.get("title") or "")
+    combined = f"{title} {full_text}"
+    text_lower = combined.lower().strip()
+    word_count = len(re.findall(r"\w+", text_lower))
+    key_lower = rule_key.lower()
+
+    # Hedging / weasel words
+    hedging_words = {
+        "might", "may", "could", "would", "should", "perhaps", "maybe",
+        "possibly", "probably", "generally", "typically", "often",
+        "somewhat", "relatively", "seems", "appears", "suggests",
+        "virtually", "nearly", "almost", "essentially",
+    }
+    # Casual / informal terms
+    informal_terms = {
+        "guys", "awesome", "basically", "actually", "literally",
+        "stuff", "things", "really", "very", "quite",
+    }
+    # Jargon / buzzword detection
+    buzzwords = {
+        "synergy", "leverage", "utilize", "paradigm", "disruptive",
+        "holistic", "scalable", "robust", "best-in-class", "game-changer",
+        "innovative", "world-class", "cutting-edge",
+    }
+    # Long sentence check
+    sentences = re.split(r"[.!?]+", combined)
+    long_sentences = sum(1 for s in sentences if len(s.split()) > 30)
+
+    if "hedging" in key_lower or "hedge" in key_lower:
+        found = [w for w in hedging_words if w in text_lower]
+        if found:
+            return False, f"Hedging language detected: {', '.join(sorted(found)[:4])}"
+        return True, "No hedging language detected."
+
+    if "informal" in key_lower or "casual" in key_lower or "tone" in key_lower:
+        found = [w for w in informal_terms if w in text_lower]
+        if found:
+            return False, f"Informal language detected: {', '.join(sorted(found)[:4])}"
+        return True, "Tone is appropriately formal."
+
+    if "jargon" in key_lower or "buzzword" in key_lower:
+        found = [w for w in buzzwords if w in text_lower]
+        if found:
+            return False, f"Buzzwords / jargon detected: {', '.join(sorted(found)[:4])}"
+        return True, "No unnecessary jargon detected."
+
+    if "passive" in key_lower:
+        passive_pattern = r"\b(is|are|was|were|been|being)\s+\w+ed\b"
+        matches = re.findall(passive_pattern, text_lower)
+        if matches:
+            return False, f"Passive voice detected ({len(matches)} instance(s)). Consider active voice."
+        return True, "No passive voice issues detected."
+
+    if "sentence" in key_lower or "readability" in key_lower:
+        if long_sentences >= 1:
+            return False, f"{long_sentences} sentence(s) exceed 30 words. Consider splitting."
+        return True, "Sentence length is within recommended limits."
+
+    if "word" in key_lower or "terse" in key_lower or "concise" in key_lower:
+        if word_count > 100:
+            return False, f"Slide has {word_count} words. Consider being more concise (aim for under 100)."
+        return True, f"Word count ({word_count}) is within guidelines."
+
+    if "structure" in key_lower:
+        has_title = bool(title.strip())
+        has_body = bool(full_text.strip())
+        if not has_title and has_body:
+            return False, "Slide has body text but no clear title."
+        if has_title and not has_body:
+            return True, "Title-only slide (acceptable for section dividers)."
+        return True, "Slide structure is appropriate."
+
+    return True, f"Rule '{rule_key}' passed validation."
 
 
 def _build_guardrail_coverage(
@@ -1962,17 +2758,19 @@ def _build_guardrail_coverage(
     language_rule_keys = [
         key for key in language_rules.keys() if key != "prohibited_phrases"
     ]
-    for idx, key in enumerate(language_rule_keys[:6]):
+    for idx, key in enumerate(language_rule_keys[:8]):
+        rule_value = language_rules.get(key)
+        passed, detail = _validate_language_rule_on_slide(key, rule_value, slide)
         add_item(
             f"language-{idx}",
             f"Language rule: {key}",
             "language",
-            "skipped",
-            "Rule is active, but deterministic per-slide validation is not yet available.",
+            "checked" if passed else "failed",
+            detail,
         )
 
     visual_patterns = (guardrail.discovered_patterns or {}).get("visual")
-    if isinstance(visual_patterns, dict) and visual_patterns:
+    if visual_patterns and (isinstance(visual_patterns, (dict, list))):
         visual_failures = [
             annotation
             for annotation in failing_annotations
@@ -2029,101 +2827,146 @@ async def get_session_evidence(session_id: str):
 async def upload_deck(
     session_id: str, background_tasks: BackgroundTasks, file: UploadFile = File(...)
 ):
-    session = _get_session_or_404(session_id)
     ensure_services_loaded()
-
-    # MIME Validation & Extension Hardening (Slides only)
-    allowed_slide_exts = {".pdf", ".pptx"}
-    filename = Path(file.filename or "deck.pdf").name
-    ext = os.path.splitext(filename)[1].lower()
-
-    if ext not in allowed_slide_exts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file extension: {ext}. For analysis, only PDF and PPTX are allowed.",
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
+        _log_session_event(
+            "upload_requested",
+            session_id,
+            filename=file.filename,
+            content_type=file.content_type,
+            snapshot=_session_snapshot(session_id, session),
         )
 
-    # Basic MIME check (heuristic)
-    content_type = (file.content_type or "").strip()
-    logger.info(
-        f"Upload MIME type: '{content_type}' (repr: {repr(content_type)}), filename: {filename}, ext: {ext}"
-    )
+        # MIME Validation & Extension Hardening (Slides only)
+        allowed_slide_exts = {".pdf", ".pptx"}
+        filename = Path(file.filename or "deck.pdf").name
+        ext = os.path.splitext(filename)[1].lower()
 
-    # Explicit allowlist of known valid MIME types for slides
-    allowed_mime_types = {
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "application/vnd.ms-powerpoint",
-        "application/octet-stream",
-        "",  # empty content_type is OK, we rely on extension check above
-    }
+        if ext not in allowed_slide_exts:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file extension: {ext}. For analysis, only PDF and PPTX are allowed.",
+            )
 
-    # Accept if MIME type is in our allowlist, starts with "application/", or is empty
-    if (
-        content_type
-        and content_type not in allowed_mime_types
-        and not content_type.startswith("application/")
-    ):
-        raise HTTPException(
-            status_code=400, detail=f"Invalid MIME type: {content_type}"
+        content_type = (file.content_type or "").strip()
+        logger.info(
+            f"Upload MIME type: '{content_type}' (repr: {repr(content_type)}), filename: {filename}, ext: {ext}"
         )
 
-    upload_dir = data_dir / "uploads" / session_id
+        allowed_mime_types = {
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.ms-powerpoint",
+            "application/octet-stream",
+            "",
+        }
 
-    upload_dir.mkdir(parents=True, exist_ok=True)
+        if (
+            content_type
+            and content_type not in allowed_mime_types
+            and not content_type.startswith("application/")
+        ):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid MIME type: {content_type}"
+            )
 
-    file_path = upload_dir / filename
+        upload_dir = data_dir / "uploads" / session_id
 
-    total_written = 0
-    chunk_size = 1024 * 1024
-    max_size = int(settings.max_file_size)
-    with open(file_path, "wb") as buffer:
-        while True:
-            chunk = await file.read(chunk_size)
-            if not chunk:
-                break
-            total_written += len(chunk)
-            if total_written > max_size:
-                buffer.close()
-                try:
-                    file_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Uploaded file exceeds max size of {max_size} bytes",
-                )
-            buffer.write(chunk)
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to create upload directory: {exc}",
+            ) from exc
 
-    document_fingerprint = analysis_history_store.compute_sha256(str(file_path))
-    history_entry = analysis_history_store.get_by_fingerprint(document_fingerprint)
+        file_path = upload_dir / filename
+        _reset_session_for_new_deck(session)
+        session["status"] = "uploading"
+        _persist_session(session_id, session)
 
-    session["deck_path"] = str(file_path)
-    session["document_fingerprint"] = document_fingerprint
-    session["original_filename"] = filename
-    session["history_available"] = history_entry is not None
-    session["status"] = "uploaded"
-    _persist_session(session_id, session)
+        total_written = 0
+        chunk_size = 1024 * 1024
+        max_size = int(settings.max_file_size)
+        try:
+            with open(file_path, "wb") as buffer:
+                while True:
+                    chunk = await file.read(chunk_size)
+                    if not chunk:
+                        break
+                    total_written += len(chunk)
+                    if total_written > max_size:
+                        buffer.close()
+                        try:
+                            file_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        session["status"] = "created"
+                        _persist_session(session_id, session)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Uploaded file exceeds max size of {max_size} bytes",
+                        )
+                    buffer.write(chunk)
+        except HTTPException:
+            raise
+        except OSError as exc:
+            session["status"] = "created"
+            _persist_session(session_id, session)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to write uploaded file: {exc}",
+            ) from exc
 
-    return {
-        "filename": filename,
-        "path": str(file_path),
-        "session_id": session_id,
-        "document_fingerprint": document_fingerprint,
-        "history_available": history_entry is not None,
-    }
+        document_fingerprint = analysis_history_store.compute_sha256(str(file_path))
+        history_entry = analysis_history_store.get_by_fingerprint(document_fingerprint)
+
+        session["deck_path"] = str(file_path)
+        session["document_fingerprint"] = document_fingerprint
+        session["original_filename"] = filename
+        session["history_available"] = history_entry is not None
+        session["status"] = "uploaded"
+        _persist_session(session_id, session)
+        _log_session_event(
+            "upload_completed",
+            session_id,
+            filename=filename,
+            document_fingerprint=document_fingerprint,
+            snapshot=_session_snapshot(session_id, session),
+        )
+
+        return {
+            "filename": filename,
+            "path": str(file_path),
+            "session_id": session_id,
+            "document_fingerprint": document_fingerprint,
+            "history_available": history_entry is not None,
+        }
 
 
 @app.post("/api/session/{session_id}/analyze")
 async def analyze_deck(session_id: str):
-    session = _get_session_or_404(session_id)
-    deck_path = session.get("deck_path")
+    # Minimize time spent holding the per-session lock: perform quick checks
+    # and mark the session as parsing under the lock, then release the lock to
+    # do heavy ingestion/conversion work. Re-acquire the lock to persist the
+    # final parsed state. This reduces contention so other endpoints (like
+    # run-analysis) can respond quickly while parsing happens.
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
+        _log_session_event(
+            "analyze_requested",
+            session_id,
+            snapshot=_session_snapshot(session_id, session),
+        )
+        deck_path = session.get("deck_path")
 
-    if not deck_path or not os.path.exists(deck_path):
-        raise HTTPException(status_code=400, detail="No deck uploaded")
+        if not deck_path or not os.path.exists(deck_path):
+            raise HTTPException(status_code=400, detail="No deck uploaded")
 
-    try:
-        ensure_services_loaded()
+        # Mark parsing and persist a minimal state change under lock
+        session["status"] = "parsing"
+        _persist_session(session_id, session)
         llm_settings = session.get("llm_settings", {})
         if llm_settings.get("context_window"):
             inference_service.set_local_context_window(llm_settings["context_window"])
@@ -2138,35 +2981,52 @@ async def analyze_deck(session_id: str):
         previews_dir.mkdir(parents=True, exist_ok=True)
         coord_unit = "absolute" if deck_path.lower().endswith(".pptx") else "percent"
 
+    # Heavy work: generate previews / ingest and convert images outside lock
+    try:
+        ensure_services_loaded()
+
+        # Fast-path: restore from history if available. Generate previews as
+        # needed but do not hold the session lock while doing it.
         if _history_entry_is_current(history_entry) and history_entry.get("scorecard"):
             await _generate_previews_for_deck(deck_path, upload_dir)
-            session.update(
-                {
-                    "deck_metadata": history_entry.get("deck_metadata", {}),
-                    "slides_data": _clone_slide_payloads_for_session(
-                        session_id, history_entry.get("slides_data", []), upload_dir
-                    ),
-                    "scorecard": history_entry.get("scorecard", {}),
-                    "annotations_by_slide": _group_annotations_by_slide(
-                        history_entry.get("scorecard", {}).get("annotations", [])
-                    ),
-                    "agent_metadata": history_entry.get("agent_metadata", {}),
-                    "deep_analysis_by_slide": history_entry.get(
-                        "deep_analysis_by_slide", {}
-                    ),
+            async with _get_session_lock(session_id):
+                session = _get_session_or_404(session_id)
+                # If the deck changed meanwhile, abort
+                if session.get("deck_path") != deck_path:
+                    raise HTTPException(status_code=400, detail="Deck changed during analysis")
+                session.update(
+                    {
+                        "deck_metadata": history_entry.get("deck_metadata", {}),
+                        "slides_data": _clone_slide_payloads_for_session(
+                            session_id, history_entry.get("slides_data", []), upload_dir
+                        ),
+                        "scorecard": history_entry.get("scorecard", {}),
+                        "annotations_by_slide": _group_annotations_by_slide(
+                            history_entry.get("scorecard", {}).get("annotations", [])
+                        ),
+                        "agent_metadata": history_entry.get("agent_metadata", {}),
+                        "deep_analysis_by_slide": history_entry.get(
+                            "deep_analysis_by_slide", {}
+                        ),
+                        "status": "analyzed",
+                        "history_restored": True,
+                        "history_restored_at": utc_now_iso(),
+                    }
+                )
+                _persist_session(session_id, session)
+                _log_session_event(
+                    "analyze_restored_from_history",
+                    session_id,
+                    snapshot=_session_snapshot(session_id, session),
+                )
+                return {
+                    "session_id": session_id,
+                    "slide_count": len(session.get("slides_data", [])),
                     "status": "analyzed",
-                    "history_restored": True,
-                    "history_restored_at": utc_now_iso(),
+                    "restored_from_history": True,
                 }
-            )
-            _persist_session(session_id, session)
-            return {
-                "session_id": session_id,
-                "slide_count": len(session.get("slides_data", [])),
-                "status": "parsed",
-                "restored_from_history": True,
-            }
 
+        # Ingest and convert the deck to images
         if deck_path.lower().endswith(".pptx"):
             deck_content = await ingestion_service.ingest_pptx(deck_path)
             await ingestion_service.convert_pptx_to_images(deck_path, str(previews_dir))
@@ -2176,7 +3036,7 @@ async def analyze_deck(session_id: str):
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format")
 
-        slides_data = []
+        slides_data: list[dict] = []
         for slide in deck_content.slides:
             preview_path = str(previews_dir / f"slide_{slide.slide_index}.png")
             slide_assets_dir = upload_dir / "assets"
@@ -2216,9 +3076,7 @@ async def analyze_deck(session_id: str):
                     "title": slide.title,
                     "preview_path": preview_path,
                     "previewUrl": f"/api/session/{session_id}/slide/{slide.slide_index}/image",
-                    "full_text": slide.title
-                    + " "
-                    + " ".join(tb.text for tb in slide.text_boxes),
+                    "full_text": slide.title + " " + " ".join(tb.text for tb in slide.text_boxes),
                     "text_boxes": [
                         {
                             "id": tb.id,
@@ -2276,12 +3134,31 @@ async def analyze_deck(session_id: str):
                 }
             )
 
-        session["slides_data"] = slides_data
-        session["deck_metadata"] = deck_content.metadata
-        session["status"] = "parsed"
-        _persist_session(session_id, session)
+        # Persist parsed results under lock and validate deck unchanged
+        async with _get_session_lock(session_id):
+            session = _get_session_or_404(session_id)
+            if session.get("deck_path") != deck_path:
+                session["status"] = "uploaded"
+                _persist_session(session_id, session)
+                _log_session_event(
+                    "analyze_failed",
+                    session_id,
+                    error="Deck changed during analysis",
+                    snapshot=_session_snapshot(session_id, session),
+                )
+                raise HTTPException(status_code=400, detail="Deck changed during analysis")
 
-        audit_log_service.log_event(
+            session["slides_data"] = slides_data
+            session["deck_metadata"] = deck_content.metadata
+            session["status"] = "parsed"
+            _persist_session(session_id, session)
+            _log_session_event(
+                "analyze_completed",
+                session_id,
+                snapshot=_session_snapshot(session_id, session),
+            )
+
+        _get_audit_log().log_event(
             session_id=session_id,
             user_role="system",
             action="PARSE_COMPLETE",
@@ -2296,10 +3173,23 @@ async def analyze_deck(session_id: str):
             "slide_count": len(slides_data),
             "status": "parsed",
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-
-        print(traceback.format_exc())
+        # Ensure we update session status to uploaded under lock on failure
+        try:
+            async with _get_session_lock(session_id):
+                session = _get_session_or_404(session_id)
+                session["status"] = "uploaded"
+                _persist_session(session_id, session)
+                _log_session_event(
+                    "analyze_failed",
+                    session_id,
+                    error=str(e),
+                    snapshot=_session_snapshot(session_id, session),
+                )
+        except Exception:
+            logger.exception("Failed while marking session failed: %s", session_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2349,101 +3239,255 @@ async def get_slide_asset(session_id: str, index: int, image_id: str):
     )
 
 
-@app.post("/api/session/{session_id}/run-analysis")
-async def run_analysis(session_id: str):
-    session = _get_session_or_404(session_id)
-    slides_data = session.get("slides_data", [])
+async def _execute_analysis(session_id: str) -> dict:
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
+        _log_session_event(
+            "run_analysis_requested",
+            session_id,
+            snapshot=_session_snapshot(session_id, session),
+        )
+        slides_data = session.get("slides_data", [])
 
-    if not slides_data:
-        raise HTTPException(status_code=400, detail="No slides to analyze")
+        if not slides_data:
+            raise HTTPException(status_code=400, detail="No slides to analyze")
 
-    if (
-        session.get("history_restored")
-        and session.get("scorecard")
-        and session.get("status") == "analyzed"
-    ):
-        return {
-            "session_id": session_id,
-            "scorecard": session.get("scorecard"),
-            "restored_from_history": True,
-        }
+        if (
+            session.get("history_restored")
+            and session.get("scorecard")
+            and session.get("status") == "analyzed"
+        ):
+            return {
+                "session_id": session_id,
+                "scorecard": session.get("scorecard"),
+                "restored_from_history": True,
+            }
 
-    ensure_services_loaded()
-    llm_settings = session.get("llm_settings", {})
-    if llm_settings.get("context_window"):
-        inference_service.set_local_context_window(llm_settings["context_window"])
-    guardrail = session.get("guardrail")
-    if not guardrail:
-        guardrail = guardrail_manager.create_guardrail()
-        session["guardrail"] = guardrail
+        ensure_services_loaded()
+        session["status"] = "analyzing"
+        llm_settings = dict(session.get("llm_settings", {}) or {})
+        guardrail = session.get("guardrail")
+        if not guardrail:
+            guardrail = guardrail_manager.create_guardrail()
+            session["guardrail"] = guardrail
+        excel_data = copy.deepcopy(session.get("excel_data"))
+        slides_data = copy.deepcopy(slides_data)
+        session_for_grounding = copy.deepcopy(session)
+        document_fingerprint = session.get("document_fingerprint")
+        deck_path = session.get("deck_path")
+        original_filename = session.get("original_filename")
+        deck_metadata = copy.deepcopy(session.get("deck_metadata", {}))
+        _persist_session(session_id, session)
 
-    excel_data = session.get("excel_data")
+    try:
+        with _startup_state_lock:
+            _analysis_runtime.update(
+                {
+                    "last_run_at": time.time(),
+                    "last_status": "running",
+                    "last_session_id": session_id,
+                    "last_error": None,
+                }
+            )
 
-    agent_results = await analysis_orchestrator.run_parallel_analysis(
-        slides_data, guardrail, excel_data
-    )
+        if llm_settings.get("context_window"):
+            inference_service.set_local_context_window(llm_settings["context_window"])
 
-    language_annotations = await language_agent.analyze_deck(
-        slides_data, guardrail.language_rules
-    )
-    source_grounding_annotations = await _build_source_grounding_annotations(session)
-    language_annotations.extend(source_grounding_annotations)
-
-    context_result = await analysis_orchestrator.run_slide_context_synthesizer(
-        slides_data,
-        agent_results,
-        language_annotations,
-    )
-    agent_results.append(context_result)
-
-    scorecard = qa_grader.calculate_scorecard(
-        agent_results, language_annotations, guardrail
-    )
-
-    scorecard_data = scorecard.model_dump()
-    scorecard_data["weights"] = _normalize_guardrail_weights(guardrail)
-    session["scorecard"] = scorecard_data
-    session["annotations_by_slide"] = _group_annotations_by_slide(
-        scorecard_data.get("annotations", [])
-    )
-    deep_analysis_by_slide = _build_deep_analysis_by_slide(
-        agent_results, language_annotations, slides_data
-    )
-    deep_analysis_by_slide = await _enrich_deep_analysis_with_slide_reviews(
-        slides_data, deep_analysis_by_slide, guardrail
-    )
-    session["deep_analysis_by_slide"] = deep_analysis_by_slide
-    session["status"] = "analyzed"
-
-    # Store agent-specific metadata for detailed slide exploration
-    agent_metadata = {}
-    for res in agent_results:
-        agent_metadata[res.agent_name] = res.metadata
-    session["agent_metadata"] = agent_metadata
-    _persist_session(session_id, session)
-
-    # Cleanup VRAM after heavy deck analysis
-    inference_service.optimize_memory()
-
-    document_fingerprint = session.get("document_fingerprint")
-    deck_path = session.get("deck_path")
-    if document_fingerprint and deck_path:
-        analysis_history_store.save_analysis(
-            fingerprint=document_fingerprint,
-            original_filename=session.get("original_filename") or Path(deck_path).name,
-            deck_path=deck_path,
-            session_id=session_id,
-            slides_data=slides_data,
-            scorecard=scorecard_data,
-            agent_metadata=agent_metadata,
-            deep_analysis_by_slide=session.get("deep_analysis_by_slide", {}),
-            deck_metadata=session.get("deck_metadata", {}),
+        agent_results = await analysis_orchestrator.run_parallel_analysis(
+            slides_data, guardrail, excel_data
         )
 
+        language_annotations = await language_agent.analyze_deck(
+            slides_data, guardrail.language_rules
+        )
+        source_grounding_annotations = await _build_source_grounding_annotations(
+            session_for_grounding
+        )
+        language_annotations.extend(source_grounding_annotations)
+
+        context_result = await analysis_orchestrator.run_slide_context_synthesizer(
+            slides_data,
+            agent_results,
+            language_annotations,
+        )
+        agent_results.append(context_result)
+
+        scorecard = qa_grader.calculate_scorecard(
+            agent_results, language_annotations, guardrail
+        )
+
+        scorecard_data = scorecard.model_dump()
+        scorecard_data["weights"] = _normalize_guardrail_weights(guardrail)
+        deep_analysis_by_slide = _build_deep_analysis_by_slide(
+            agent_results, language_annotations, slides_data
+        )
+        deep_analysis_by_slide = await _enrich_deep_analysis_with_slide_reviews(
+            slides_data, deep_analysis_by_slide, guardrail
+        )
+
+        agent_metadata = {}
+        for res in agent_results:
+            agent_metadata[res.agent_name] = res.metadata
+
+        async with _get_session_lock(session_id):
+            session = _get_session_or_404(session_id)
+            session["scorecard"] = scorecard_data
+            session["annotations_by_slide"] = _group_annotations_by_slide(
+                scorecard_data.get("annotations", [])
+            )
+            session["deep_analysis_by_slide"] = deep_analysis_by_slide
+            session["agent_metadata"] = agent_metadata
+            session["status"] = "analyzed"
+            _persist_session(session_id, session)
+            _log_session_event(
+                "run_analysis_completed",
+                session_id,
+                snapshot=_session_snapshot(session_id, session),
+            )
+
+        inference_service.optimize_memory()
+
+                # Auto-tune guardrail weights based on dimension scores
+        try:
+            _auto_tune_guardrail(guardrail, scorecard_data.get("annotations", []))
+        except Exception:
+            logger.exception("Guardrail auto-tuning failed (non-fatal)")
+
+        if document_fingerprint and deck_path:
+            analysis_history_store.save_analysis(
+                fingerprint=document_fingerprint,
+                original_filename=original_filename or Path(deck_path).name,
+                deck_path=deck_path,
+                session_id=session_id,
+                slides_data=slides_data,
+                scorecard=scorecard_data,
+                agent_metadata=agent_metadata,
+                deep_analysis_by_slide=deep_analysis_by_slide,
+                deck_metadata=deck_metadata,
+            )
+
+        return {
+            "session_id": session_id,
+            "scorecard": scorecard_data,
+        }
+    except Exception as exc:
+        with _startup_state_lock:
+            _analysis_runtime.update(
+                {
+                    "last_run_at": time.time(),
+                    "last_status": "failed",
+                    "last_session_id": session_id,
+                    "last_error": str(exc),
+                }
+            )
+        async with _get_session_lock(session_id):
+            session = _get_session_or_404(session_id)
+            session["status"] = "parsed"
+            _persist_session(session_id, session)
+            _log_session_event(
+                "run_analysis_failed",
+                session_id,
+                snapshot=_session_snapshot(session_id, session),
+            )
+        raise
+
+    finally:
+        if _analysis_runtime.get("last_status") == "running":
+            with _startup_state_lock:
+                _analysis_runtime.update(
+                    {
+                        "last_run_at": time.time(),
+                        "last_status": "succeeded",
+                        "last_session_id": session_id,
+                        "last_error": None,
+                    }
+                )
+
+
+async def _run_analysis_job(session_id: str) -> None:
+    _set_analysis_job(session_id, status="running", progress_label="Running analysis agents")
+    try:
+        result = await _execute_analysis(session_id)
+        _set_analysis_job(
+            session_id,
+            status="completed",
+            progress_label="Analysis complete",
+            result=result,
+            error=None,
+        )
+    except Exception as exc:
+        _set_analysis_job(
+            session_id,
+            status="failed",
+            progress_label="Analysis failed",
+            error=str(exc),
+        )
+
+
+@app.post("/api/session/{session_id}/run-analysis")
+async def run_analysis(session_id: str):
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
+        slides_data = session.get("slides_data", [])
+        if not slides_data:
+            raise HTTPException(status_code=400, detail="No slides to analyze")
+        if (
+            session.get("history_restored")
+            and session.get("scorecard")
+            and session.get("status") == "analyzed"
+        ):
+            return {
+                "session_id": session_id,
+                "scorecard": session.get("scorecard"),
+                "restored_from_history": True,
+                "job_status": "completed",
+            }
+
+    existing = _get_analysis_job(session_id)
+    if existing and existing.get("status") in {"queued", "running"}:
+        return {
+            "session_id": session_id,
+            "job_status": existing.get("status"),
+            "progress_label": existing.get("progress_label"),
+        }
+
+    _set_analysis_job(
+        session_id,
+        status="queued",
+        progress_label="Queued analysis",
+        result=None,
+        error=None,
+    )
+    asyncio.create_task(_run_analysis_job(session_id))
     return {
         "session_id": session_id,
-        "scorecard": scorecard_data,
+        "job_status": "queued",
+        "progress_label": "Queued analysis",
     }
+
+
+@app.get("/api/session/{session_id}/run-analysis/status")
+async def get_run_analysis_status(session_id: str):
+    _get_session_or_404(session_id)
+    job = _get_analysis_job(session_id)
+    if not job:
+        return {
+            "session_id": session_id,
+            "job_status": "idle",
+            "progress_label": None,
+        }
+
+    payload = {
+        "session_id": session_id,
+        "job_status": job.get("status", "idle"),
+        "progress_label": job.get("progress_label"),
+        "updated_at": job.get("updated_at"),
+    }
+    if job.get("status") == "completed" and job.get("result") is not None:
+        payload["scorecard"] = job["result"].get("scorecard")
+    if job.get("status") == "failed":
+        payload["error"] = job.get("error") or "Analysis failed"
+    return payload
 
 
 @app.get("/api/session/{session_id}/slide/{index}/analysis")
@@ -2492,7 +3536,6 @@ async def get_slide_analysis(session_id: str, index: int):
             },
             "guardrailCoverage": guardrail_coverage,
             "analysisBackends": {
-                "surya": False,
                 "vision": "unknown",
                 "ocr": "unknown",
             },
@@ -2511,7 +3554,7 @@ async def get_slide_analysis(session_id: str, index: int):
         session["annotations_by_slide"] = grouped_annotations
         slide_annotations = grouped_annotations.get(str(index), [])
 
-    # Get visuals and density from Visual Analysis Agent metadata (SURYA powered)
+    # Get visuals and density from Visual Analysis Agent metadata
     visual_agent_meta = agent_metadata.get("Visual Analysis Agent", {})
     visual_meta = (visual_agent_meta.get("slides_analysis", {}) or {}).get(
         str(index), {}
@@ -2528,13 +3571,6 @@ async def get_slide_analysis(session_id: str, index: int):
         item["visualKey"] = visual_key
         keyed_image_analysis.append(item)
 
-    surya_matchers: dict[str, list[str]] = {}
-    for item in keyed_image_analysis:
-        if item.get("type") == "surya_block":
-            label = str(item.get("label") or "visual").lower()
-            surya_matchers.setdefault(label, []).append(item["visualKey"])
-
-    assigned_surya: dict[str, int] = {label: 0 for label in surya_matchers}
     visuals = []
     for raw_visual in visual_meta.get("visuals", []):
         visual = dict(raw_visual)
@@ -2552,14 +3588,7 @@ async def get_slide_analysis(session_id: str, index: int):
         visual_key = visual.get("visual_key")
         if not visual_key:
             label = str(visual.get("label") or "visual").lower()
-            matches = surya_matchers.get(label, [])
-            next_idx = assigned_surya.get(label, 0)
-            if next_idx < len(matches):
-                visual_key = matches[next_idx]
-                assigned_surya[label] = next_idx + 1
-            else:
-                visual_key = f"{label}_{next_idx}"
-                assigned_surya[label] = next_idx + 1
+            visual_key = f"{label}_0"
         visuals.append(
             {
                 "top": box["top"],
@@ -2741,7 +3770,6 @@ async def get_slide_analysis(session_id: str, index: int):
     )
     ocr_backend = str(slide.get("ocr_backend") or "native")
     analysis_backends = {
-        "surya": bool(visual_agent_meta.get("surya_used")),
         "vision": visual_agent_meta.get("vision_backend", "unknown"),
         "ocr": ocr_backend,
     }
@@ -2861,7 +3889,7 @@ async def apply_session_guardrail(
 
     playbook_rule_count = len(applied_guardrail.playbook_rules or [])
     human_rule_count = len(applied_guardrail.human_confirmed_rules or [])
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role=x_user_role or "junior",
         action="APPLY_GUARDRAIL",
@@ -2914,7 +3942,7 @@ async def save_session_guardrail_template(
     with open(filepath, "w") as f:
         json.dump(template_guardrail.model_dump(), f, indent=2)
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role=x_user_role or "junior",
         action="SAVE_GUARDRAIL_TEMPLATE",
@@ -3029,7 +4057,7 @@ async def activate_guardrail_template(
     _invalidate_session_analysis(session)
     _persist_session(session_id, session)
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role=x_user_role or "junior",
         action="ACTIVATE_GUARDRAIL_TEMPLATE",
@@ -3120,7 +4148,7 @@ async def sign_guardrail(
     session["guardrail"] = signed_guardrail
     _persist_session(session_id, session)
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role="senior",
         action="SIGN_GUARDRAIL",
@@ -3137,7 +4165,7 @@ async def sign_guardrail(
 async def get_audit_log(session_id: str):
     _get_session_or_404(session_id)
     try:
-        events = audit_log_service.get_events(session_id)
+        events = _get_audit_log().get_events(session_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load audit log: {e}")
     return {"entries": events}
@@ -3192,7 +4220,7 @@ async def record_override(
     category = annotation.get("category", "unknown")
     slide_index = annotation.get("slide_index", 0)
 
-    adaptation_agent.log_override_decision(
+    _get_adaptation_agent().log_override_decision(
         session_id=session_id,
         annotation_id=req.annotation_id,
         category=category,
@@ -3200,7 +4228,7 @@ async def record_override(
         slide_index=slide_index,
     )
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role=role,
         action="OVERRIDE",
@@ -3254,7 +4282,7 @@ async def accept_fix(
         else:
             accepted.append(annotation)
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role=role,
         action="ACCEPT_FIX",
@@ -3274,95 +4302,98 @@ async def accept_fix(
 
 @app.post("/api/session/{session_id}/revision")
 async def run_revision_loop(session_id: str):
-    session = _get_session_or_404(session_id)
-    scorecard_data = session.get("scorecard")
-    slides_data = session.get("slides_data", [])
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
+        scorecard_data = session.get("scorecard")
+        slides_data = session.get("slides_data", [])
 
-    if not scorecard_data:
-        raise HTTPException(status_code=400, detail="No analysis completed")
+        if not scorecard_data:
+            raise HTTPException(status_code=400, detail="No analysis completed")
 
-    scorecard = QAScorecard(**scorecard_data)
-
-    attempt = 0
-    max_attempts = 3
-    score_history = [scorecard.composite_score]
-
-    while attempt < max_attempts:
-        should_revise = await revision_orchestrator.should_revise(scorecard, attempt)
-
-        if not should_revise:
-            break
-
-        fixes = await revision_orchestrator.apply_auto_remediation(
-            scorecard, slides_data
-        )
-
-        session["auto_fixes"] = session.get("auto_fixes", []) + fixes
-
-        current_guardrail = session.get("guardrail", GuardrailSchema())
-        if isinstance(current_guardrail, dict):
-            current_guardrail = GuardrailSchema(**current_guardrail)
-            session["guardrail"] = current_guardrail
-        excel_data = session.get("excel_data")
-
-        agent_results = await analysis_orchestrator.run_parallel_analysis(
-            slides_data, current_guardrail, excel_data
-        )
-
-        language_annotations = await language_agent.analyze_deck(
-            slides_data, current_guardrail.language_rules
-        )
-        source_grounding_annotations = await _build_source_grounding_annotations(
-            session
-        )
-        language_annotations.extend(source_grounding_annotations)
-
-        context_result = await analysis_orchestrator.run_slide_context_synthesizer(
-            slides_data,
-            agent_results,
-            language_annotations,
-        )
-        agent_results.append(context_result)
-
-        scorecard = qa_grader.calculate_scorecard(
-            agent_results,
-            language_annotations,
-            current_guardrail,
-        )
-
-        score_history.append(scorecard.composite_score)
-        scorecard_data = scorecard.model_dump()
-        scorecard_data["weights"] = _normalize_guardrail_weights(
-            session.get("guardrail", GuardrailSchema())
-        )
-        session["scorecard"] = scorecard_data
-        session["annotations_by_slide"] = _group_annotations_by_slide(
-            scorecard_data.get("annotations", [])
-        )
-        deep_analysis_by_slide = _build_deep_analysis_by_slide(
-            agent_results, language_annotations, slides_data
-        )
-        deep_analysis_by_slide = await _enrich_deep_analysis_with_slide_reviews(
-            slides_data, deep_analysis_by_slide, current_guardrail
-        )
-        session["deep_analysis_by_slide"] = deep_analysis_by_slide
-
-        agent_metadata = {}
-        for res in agent_results:
-            agent_metadata[res.agent_name] = res.metadata
-        session["agent_metadata"] = agent_metadata
-        session["status"] = "analyzed"
+        session["status"] = "revising"
         _persist_session(session_id, session)
+        scorecard = QAScorecard(**scorecard_data)
 
-        attempt += 1
+        attempt = 0
+        max_attempts = 3
+        score_history = [scorecard.composite_score]
 
-    return {
-        "session_id": session_id,
-        "revision_count": attempt,
-        "score_history": score_history,
-        "final_score": scorecard.composite_score,
-        "auto_fixes_applied": len(session.get("auto_fixes", [])),
-    }
+        while attempt < max_attempts:
+            should_revise = await revision_orchestrator.should_revise(scorecard, attempt)
+
+            if not should_revise:
+                break
+
+            fixes = await revision_orchestrator.apply_auto_remediation(
+                scorecard, slides_data
+            )
+
+            session["auto_fixes"] = session.get("auto_fixes", []) + fixes
+
+            current_guardrail = session.get("guardrail", GuardrailSchema())
+            if isinstance(current_guardrail, dict):
+                current_guardrail = GuardrailSchema(**current_guardrail)
+                session["guardrail"] = current_guardrail
+            excel_data = session.get("excel_data")
+
+            agent_results = await analysis_orchestrator.run_parallel_analysis(
+                slides_data, current_guardrail, excel_data
+            )
+
+            language_annotations = await language_agent.analyze_deck(
+                slides_data, current_guardrail.language_rules
+            )
+            source_grounding_annotations = await _build_source_grounding_annotations(
+                session
+            )
+            language_annotations.extend(source_grounding_annotations)
+
+            context_result = await analysis_orchestrator.run_slide_context_synthesizer(
+                slides_data,
+                agent_results,
+                language_annotations,
+            )
+            agent_results.append(context_result)
+
+            scorecard = qa_grader.calculate_scorecard(
+                agent_results,
+                language_annotations,
+                current_guardrail,
+            )
+
+            score_history.append(scorecard.composite_score)
+            scorecard_data = scorecard.model_dump()
+            scorecard_data["weights"] = _normalize_guardrail_weights(
+                session.get("guardrail", GuardrailSchema())
+            )
+            session["scorecard"] = scorecard_data
+            session["annotations_by_slide"] = _group_annotations_by_slide(
+                scorecard_data.get("annotations", [])
+            )
+            deep_analysis_by_slide = _build_deep_analysis_by_slide(
+                agent_results, language_annotations, slides_data
+            )
+            deep_analysis_by_slide = await _enrich_deep_analysis_with_slide_reviews(
+                slides_data, deep_analysis_by_slide, current_guardrail
+            )
+            session["deep_analysis_by_slide"] = deep_analysis_by_slide
+
+            agent_metadata = {}
+            for res in agent_results:
+                agent_metadata[res.agent_name] = res.metadata
+            session["agent_metadata"] = agent_metadata
+            session["status"] = "analyzed"
+            _persist_session(session_id, session)
+
+            attempt += 1
+
+        return {
+            "session_id": session_id,
+            "revision_count": attempt,
+            "score_history": score_history,
+            "final_score": scorecard.composite_score,
+            "auto_fixes_applied": len(session.get("auto_fixes", [])),
+        }
 
 
 @app.post("/api/session/{session_id}/prepare")
@@ -3414,7 +4445,7 @@ async def prepare_for_delivery(session_id: str, role: str = Depends(require_seni
     metadata_path = Path(deck_path).parent / "Metadata.json"
 
     # Export Audit Log
-    audit_log_service.export_csv(session_id, str(audit_csv_path))
+    _get_audit_log().export_csv(session_id, str(audit_csv_path))
 
     # Create Metadata
     metadata = {
@@ -3449,7 +4480,7 @@ async def sign_off_session(
     session["senior_signed"] = True
     session["senior_name"] = request.user_name
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role="senior",
         action="SENIOR_SIGN_OFF",
@@ -3523,7 +4554,7 @@ async def log_engagement_completion(
     session = _get_session_or_404(session_id)
     scorecard_data = session.get("scorecard", {})
 
-    adaptation_agent.log_engagement_completion(
+    _get_adaptation_agent().log_engagement_completion(
         engagement_type=engagement_type,
         client_namespace=client_namespace,
         score_history=scorecard_data.get("score_history", []),
@@ -3538,7 +4569,7 @@ async def log_engagement_completion(
 
 @app.get("/api/patterns/suggestions")
 async def get_pattern_suggestions(engagement_type: str = None):
-    analysis = adaptation_agent.analyze_and_suggest(engagement_type)
+    analysis = _get_adaptation_agent().analyze_and_suggest(engagement_type)
 
     return analysis
 
@@ -3670,6 +4701,8 @@ async def discover_template(
     playbook_text: str = None,
     engagement_type: str = "strategy",
 ):
+    from app.agents.template_discovery import template_discovery_agent
+
     if not gold_slides and not playbook_text:
         raise HTTPException(
             status_code=400, detail="Provide gold_slides or playbook_text"
@@ -3695,6 +4728,8 @@ async def discover_template(
 async def discover_template_from_upload(
     session_id: str, file: UploadFile = File(...), engagement_type: str = "strategy"
 ):
+    from app.agents.template_discovery import template_discovery_agent
+
     _get_session_or_404(session_id)
 
     allowed_exts = {".pdf", ".docx", ".txt", ".md"}
@@ -3706,8 +4741,29 @@ async def discover_template_from_upload(
             detail=f"Unsupported playbook extension: {ext}. Allowed: {sorted(allowed_exts)}",
         )
 
-    content = await file.read()
-    _enforce_upload_size(content)
+    # Stream read with size enforcement BEFORE loading entire file
+    max_size = int(settings.max_file_size)
+    content = b""
+    chunk_size = 1024 * 1024
+    try:
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            content += chunk
+            if len(content) > max_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Uploaded playbook file exceeds max size of {max_size} bytes",
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read playbook file: {exc}",
+        ) from exc
+    
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded playbook file is empty")
 
@@ -3730,7 +4786,7 @@ async def discover_template_from_upload(
     guardrail = await template_discovery_agent.discover_from_playbook(playbook_text)
     guardrail.engagement_type = engagement_type
 
-    audit_log_service.log_event(
+    _get_audit_log().log_event(
         session_id=session_id,
         user_role="analyst",
         action="DISCOVERY_PLAYBOOK_UPLOAD",
@@ -3866,9 +4922,31 @@ async def update_analysis_settings(analysis_max_tokens: int):
 
 
 async def get_grammar_status():
+    if language_agent is None:
+        return {
+            "enabled": True,
+            "engine": "regex_fallback",
+            "language_tool_available": False,
+            "base_url": "",
+            "check_url": None,
+            "last_error": None,
+            "notes": "Grammar service is still loading in the background. Retry shortly.",
+        }
+
     lt_status = await language_agent.lt_client.status()
     language_tool_available = lt_status.get("available", False)
+    lt_engine = lt_status.get("engine", "regex_fallback")
     lt_error = lt_status.get("last_error")
+
+    if lt_engine == "local_languagetool":
+        notes = "Full grammar and spelling checks are active via local server."
+    elif lt_engine == "cloud_languagetool":
+        notes = "Full grammar and spelling checks are active via cloud API fallback."
+    else:
+        notes = "LanguageTool is offline, so lighter regex-based grammar checks are active."
+        if lt_error:
+            notes += f" Last error: {lt_error}"
+
     return {
         "enabled": True,
         "engine": "languagetool" if language_tool_available else "regex_fallback",
@@ -3876,49 +4954,97 @@ async def get_grammar_status():
         "base_url": language_agent.lt_client.base_url,
         "check_url": lt_status.get("check_url"),
         "last_error": lt_error,
-        "notes": (
-            "Full grammar and spelling checks are active."
-            if language_tool_available
-            else (
-                "LanguageTool is unavailable, so lighter regex-based grammar checks are active."
-                + (f" Last error: {lt_error}" if lt_error else "")
-            )
-        ),
+        "notes": notes,
+    }
+
+
+async def get_runtime_asset_status():
+    status = model_registry.get_runtime_status()
+    return {
+        "ocr": status,
+        "download_active": bool(status.get("download_active")),
+        "download_required": bool(status.get("download_required")),
     }
 
 
 async def test_llm_connection():
+    provider = inference_service.current_provider
+    provider_enum = InferenceProvider(provider)
+    provider_config = None
+    try:
+        provider_config = inference_service.get_provider_connection_config(provider_enum)
+    except ValueError:
+        provider_config = None
+
+    base_url = provider_config.base_url if provider_config else ""
+    model = provider_config.model if provider_config else provider
+
     if inference_service.llm is None:
         if inference_service.current_provider == InferenceProvider.API.value:
             api_config = inference_service.get_provider_connection_config(
                 InferenceProvider.API
             )
             if not api_config.api_key:
-                raise HTTPException(
+                raise _structured_http_exception(
                     status_code=400,
-                    detail="Cloud AI is selected but no API key is configured. Save provider settings and try again.",
+                    code="LLM_API_KEY_MISSING",
+                    title="Cloud AI API key is missing",
+                    message=(
+                        "Cloud AI is selected but no API key is configured."
+                    ),
+                    hint=(
+                        "Open settings, add an API key, then use Save & test."
+                    ),
+                    endpoint="/api/settings/local-llm/test",
+                    provider=provider,
+                    base_url=base_url,
+                    model=model,
                 )
-        raise HTTPException(
+        raise _structured_http_exception(
             status_code=400,
-            detail="No LLM provider configured. Save provider settings and try again.",
+            code="LLM_PROVIDER_NOT_READY",
+            title="LLM provider is not ready",
+            message="No LLM provider is currently configured for inference.",
+            hint=_llm_provider_runtime_hint(provider, base_url),
+            endpoint="/api/settings/local-llm/test",
+            provider=provider,
+            base_url=base_url,
+            model=model,
         )
     try:
+        started = time.perf_counter()
         messages = [Message(role="user", content="Say exactly 'OK' and nothing else.")]
         response = await inference_service.llm.generate(messages, max_tokens=10)
+        latency_ms = int((time.perf_counter() - started) * 1000)
         return {
+            "ok": True,
             "status": "success",
-            "response": response.content,
+            "response": (response.content or "").strip(),
             "provider": inference_service.current_provider,
             "model": response.model,
+            "latency_ms": latency_ms,
+            "error_message": None,
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        title, hint = _llm_connection_error_detail(e)
+        raise _structured_http_exception(
+            status_code=400,
+            code="LLM_CONNECTION_TEST_FAILED",
+            title=title,
+            message=str(e),
+            hint=hint,
+            endpoint="/api/settings/local-llm/test",
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            details={
+                "runtime_hint": _llm_provider_runtime_hint(provider, base_url),
+            },
+        )
 
 
 async def get_llm_diagnostics():
     """Connection diagnostics and provider status for the LLM engine."""
-    import socket
-
     diagnostics = {
         "current_provider": inference_service.current_provider,
         "llm_available": inference_service.llm is not None,
@@ -3940,28 +5066,22 @@ async def get_llm_diagnostics():
     }
 
     # Check LM Studio
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            lm_studio_up = s.connect_ex(("localhost", 1234)) == 0
-    except Exception:
-        lm_studio_up = False
+    lm_studio_probe = _socket_probe("http://127.0.0.1:1234/v1")
+    lm_studio_up = bool(lm_studio_probe.get("ok"))
     diagnostics["providers"]["lm_studio"] = {
         "port": 1234,
         "reachable": lm_studio_up,
+        "latency_ms": lm_studio_probe.get("latency_ms"),
         **_provider_response(InferenceProvider.LM_STUDIO),
     }
 
     # Check Ollama
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            ollama_up = s.connect_ex(("localhost", 11434)) == 0
-    except Exception:
-        ollama_up = False
+    ollama_probe = _socket_probe("http://127.0.0.1:11434/v1")
+    ollama_up = bool(ollama_probe.get("ok"))
     diagnostics["providers"]["ollama"] = {
         "port": 11434,
         "reachable": ollama_up,
+        "latency_ms": ollama_probe.get("latency_ms"),
         **_provider_response(InferenceProvider.OLLAMA),
     }
 
@@ -4022,125 +5142,193 @@ async def list_available_models():
 @app.post("/api/session/{session_id}/upload-source")
 async def upload_source_document(session_id: str, file: UploadFile = File(...)):
     """Upload source documents (PDF/XLSX/DOCX) for claim evidence checking."""
-    session = _get_session_or_404(session_id)
     ensure_services_loaded()
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
 
-    # 1. Source MIME Validation & Extension Hardening
-    allowed_source_exts = {".pdf", ".xlsx", ".xls", ".docx", ".txt", ".csv", ".md"}
-    filename = Path(file.filename or "source.pdf").name
-    ext = os.path.splitext(filename)[1].lower()
+        allowed_source_exts = {".pdf", ".xlsx", ".xls", ".docx", ".txt", ".csv", ".md"}
+        filename = Path(file.filename or "source.pdf").name
+        ext = os.path.splitext(filename)[1].lower()
 
-    if ext not in allowed_source_exts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported source extension: {ext}. Allowed: {allowed_source_exts}",
+        if ext not in allowed_source_exts:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported source extension: {ext}. Allowed: {allowed_source_exts}",
+            )
+
+        # Stream read with size enforcement BEFORE loading entire file
+        max_size = int(settings.max_file_size)
+        content = b""
+        chunk_size = 1024 * 1024
+        try:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                content += chunk
+                if len(content) > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded source file exceeds max size of {max_size} bytes",
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to read source file: {exc}",
+            ) from exc
+        
+        source_dir = data_dir / "sessions" / session_id / "sources"
+        try:
+            source_dir.mkdir(parents=True, exist_ok=True)
+            filepath = source_dir / filename
+            filepath.write_bytes(content)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to store source document: {exc}",
+            ) from exc
+
+        try:
+            documents = _extract_uploaded_document_text(filename, content, filepath)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to parse source document: {e}"
+            )
+
+        if documents:
+            namespace = f"session_{session_id}"
+            chroma_manager.add_documents(
+                namespace=namespace,
+                documents=documents,
+                ids=[f"src_{filename}_{i}" for i in range(len(documents))],
+                metadatas=[{"source": filename, "index": i} for i in range(len(documents))],
+            )
+            session["source_namespace"] = namespace
+            source_files = [
+                existing for existing in session.setdefault("source_files", []) if existing != filename
+            ]
+            source_files.append(filename)
+            session["source_files"] = source_files
+            source_indexed_chunks = session.setdefault("source_indexed_chunks", {})
+            source_indexed_chunks[filename] = len(documents)
+
+        if session.get("scorecard"):
+            _invalidate_session_analysis(session)
+        elif session.get("slides_data"):
+            session["history_restored"] = False
+            session.pop("history_restored_at", None)
+            session["status"] = "parsed"
+
+        _persist_session(session_id, session)
+
+        _get_audit_log().log_event(
+            session_id=session_id,
+            user_role="analyst",
+            action="UPLOAD_SOURCE",
+            details={"filename": filename, "docs_indexed": len(documents)},
         )
 
-    # 2. Extract Source Content
-
-    content = await file.read()
-    _enforce_upload_size(content)
-    source_dir = data_dir / "sessions" / session_id / "sources"
-    source_dir.mkdir(parents=True, exist_ok=True)
-
-    filepath = source_dir / filename
-    filepath.write_bytes(content)
-
-    # Extract text based on file type and index in ChromaDB
-    try:
-        documents = _extract_uploaded_document_text(filename, content, filepath)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to parse source document: {e}"
-        )
-
-    if documents:
-        namespace = f"session_{session_id}"
-        chroma_manager.add_documents(
-            namespace=namespace,
-            documents=documents,
-            ids=[f"src_{filename}_{i}" for i in range(len(documents))],
-            metadatas=[{"source": filename, "index": i} for i in range(len(documents))],
-        )
-        session["source_namespace"] = namespace
-        session.setdefault("source_files", []).append(filename)
-        source_indexed_chunks = session.setdefault("source_indexed_chunks", {})
-        source_indexed_chunks[filename] = len(documents)
-
-    _persist_session(session_id, session)
-
-    audit_log_service.log_event(
-        session_id=session_id,
-        user_role="analyst",
-        action="UPLOAD_SOURCE",
-        details={"filename": filename, "docs_indexed": len(documents)},
-    )
-
-    return {
-        "status": "indexed",
-        "filename": filename,
-        "documents_indexed": len(documents),
-        "total_sources": len(session.get("source_files", [])),
-    }
+        return {
+            "status": "indexed",
+            "filename": filename,
+            "documents_indexed": len(documents),
+            "total_sources": len(session.get("source_files", [])),
+        }
 
 
 @app.post("/api/session/{session_id}/upload-excel")
 async def upload_excel_for_data_lineage(session_id: str, file: UploadFile = File(...)):
     """Upload Excel file for data lineage verification (chart vs Excel comparison)."""
-    session = _get_session_or_404(session_id)
+    async with _get_session_lock(session_id):
+        session = _get_session_or_404(session_id)
 
-    filename = Path(file.filename or "data.xlsx").name
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in (".xlsx", ".xls"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only Excel files (.xlsx, .xls) are accepted for data lineage.",
-        )
+        filename = Path(file.filename or "data.xlsx").name
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".xlsx", ".xls"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only Excel files (.xlsx, .xls) are accepted for data lineage.",
+            )
 
-    content = await file.read()
-    _enforce_upload_size(content)
-    upload_dir = data_dir / "uploads" / session_id
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    filepath = upload_dir / filename
-    filepath.write_bytes(content)
+        # Stream read with size enforcement BEFORE loading entire file
+        max_size = int(settings.max_file_size)
+        content = b""
+        chunk_size = 1024 * 1024
+        try:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                content += chunk
+                if len(content) > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded Excel file exceeds max size of {max_size} bytes",
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to read Excel file: {exc}",
+            ) from exc
+        
+        upload_dir = data_dir / "uploads" / session_id
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            filepath = upload_dir / filename
+            filepath.write_bytes(content)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to store Excel source: {exc}",
+            ) from exc
 
-    from openpyxl import load_workbook
+        from openpyxl import load_workbook
 
-    try:
-        wb = load_workbook(str(filepath), data_only=True)
-        sheets = {}
-        for sheet in wb.worksheets:
-            rows = []
-            for row in sheet.iter_rows(values_only=True):
-                row_data = [str(cell) if cell is not None else "" for cell in row]
-                if any(row_data):
-                    rows.append(row_data)
-            sheets[sheet.title] = rows
+        try:
+            wb = load_workbook(str(filepath), data_only=True)
+            sheets = {}
+            for sheet in wb.worksheets:
+                rows = []
+                for row in sheet.iter_rows(values_only=True):
+                    row_data = [str(cell) if cell is not None else "" for cell in row]
+                    if any(row_data):
+                        rows.append(row_data)
+                sheets[sheet.title] = rows
 
-        excel_data = {"sheets": sheets, "file_path": str(filepath)}
-        session["excel_data"] = excel_data
+            excel_data = {"sheets": sheets, "file_path": str(filepath)}
+            session["excel_data"] = excel_data
+            if session.get("scorecard"):
+                _invalidate_session_analysis(session)
+            elif session.get("slides_data"):
+                session["history_restored"] = False
+                session.pop("history_restored_at", None)
+                session["status"] = "parsed"
 
-        _persist_session(session_id, session)
+            _persist_session(session_id, session)
 
-        audit_log_service.log_event(
-            session_id=session_id,
-            user_role="analyst",
-            action="UPLOAD_EXCEL",
-            details={
+            _get_audit_log().log_event(
+                session_id=session_id,
+                user_role="analyst",
+                action="UPLOAD_EXCEL",
+                details={
+                    "filename": filename,
+                    "sheet_count": len(sheets),
+                    "total_rows": sum(len(r) for r in sheets.values()),
+                },
+            )
+
+            return {
+                "status": "loaded",
                 "filename": filename,
-                "sheet_count": len(sheets),
+                "sheets": list(sheets.keys()),
                 "total_rows": sum(len(r) for r in sheets.values()),
-            },
-        )
-
-        return {
-            "status": "loaded",
-            "filename": filename,
-            "sheets": list(sheets.keys()),
-            "total_rows": sum(len(r) for r in sheets.values()),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {e}")
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse Excel: {e}")
 
 
 @app.get("/api/session/{session_id}/slide/{index}/image-analysis")
@@ -4192,9 +5380,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.data_dir:
-        data_dir = Path(args.data_dir).expanduser().resolve()
-        data_dir.mkdir(parents=True, exist_ok=True)
-        settings.data_dir = str(data_dir)
-        session_store = SQLiteSessionStore(str(data_dir / "sessions.db"))
+        init_state(args.data_dir)
+        os.environ["SLIDEFORGE_DATA_DIR"] = str(data_dir)
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run("app.main:app", host=args.host, port=args.port, factory=False)

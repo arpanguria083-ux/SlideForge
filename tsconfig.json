@@ -11,7 +11,9 @@
     ],
     "skipLibCheck": true,
     "types": [
-      "node"
+      "node",
+      "vitest/globals",
+      "@testing-library/jest-dom"
     ],
     "moduleResolution": "bundler",
     "isolatedModules": true,
@@ -25,5 +27,23 @@
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
-  }
+  },
+  "include": [
+    "App.tsx",
+    "index.tsx",
+    "types.ts",
+    "global.d.ts",
+    "pdfjs-dist.d.ts",
+    "components/**/*.ts",
+    "components/**/*.tsx",
+    "services/**/*.ts",
+    "services/**/*.tsx"
+  ],
+  "exclude": [
+    "dist",
+    "backend",
+    "electron",
+    "node_modules",
+    ".kilo"
+  ]
 }

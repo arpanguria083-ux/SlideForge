@@ -1,0 +1,43 @@
+appId: com.slideforge.ai
+productName: SlideForge AI Lite
+copyright: Copyright © 2026 SlideForge
+directories:
+  output: release/electron-lite
+  buildResources: buildResources
+files:
+  - dist/**
+  - '!dist/electron/**'
+  - dist-electron/**
+  - legal/**
+extraResources:
+  - from: backend/dist-package/SlideForge
+    to: backend
+    filter:
+      - "**/*"
+      - "!**/*.dist-info/licenses/**"
+      - "!**/*.pyc"
+      - "!**/__pycache__/**"
+# Windows code signing is controlled via environment variables:
+#   CSC_LINK          — file:///path/to/cert.pfx (or Base64-encoded in CI)
+#   CSC_KEY_PASSWORD  — PFX file password
+# Set these to enable Authenticode signing.
+# Without them, builds will be unsigned (no SmartScreen trust).
+win:
+  target:
+    - target: nsis
+    - target: portable
+mac:
+  target: dmg
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: SlideForge AI Lite
+  warningsAsErrors: false
+  license: legal/OPEN_SOURCE_INSTALLER_AGREEMENT.txt
+portable:
+  artifactName: ${productName}-${version}-portable.exe
+asar: false
+

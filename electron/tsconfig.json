@@ -5,8 +5,8 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "outDir": "../dist/electron",
-    "moduleResolution": "Node",
+    "outDir": "../dist-electron",
+    "moduleResolution": "node10",
     "types": ["node", "electron"]
   },
   "include": ["./**/*.ts"]

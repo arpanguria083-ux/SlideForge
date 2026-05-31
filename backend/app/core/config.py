@@ -13,4 +13,8 @@ class AppSettings(BaseSettings):
     max_active_sessions: int = 500
     max_active_sessions_per_namespace: int = 100
 
-    model_config = ConfigDict(env_file=".env", extra="ignore")
+    model_config = ConfigDict(
+        env_file=".env",
+        extra="ignore",
+        env_prefix="SLIDEFORGE_",
+    )

@@ -39,18 +39,66 @@ const TermsModal: React.FC<TermsModalProps> = ({ open, accepted, onAccept }) => 
           </section>
 
           <section>
-            <h3 className="mb-2 font-semibold text-slate-900">Full Text References</h3>
-            <ul className="list-disc space-y-1 pl-5 text-slate-600">
-              <li>`legal/TERMS_AND_CONDITIONS.md`</li>
-              <li>`legal/PRIVACY_NOTICE.md`</li>
+            <h3 className="mb-2 font-semibold text-slate-900">Connectivity and Model Downloads</h3>
+            <p>
+              SlideForge is offline-first, but not every feature is guaranteed to be offline-only in every
+              configuration.
+            </p>
+            <ul className="mt-3 list-disc space-y-2 pl-5 text-slate-600">
+              <li>Uploads, sessions, review history, logs, and generated workspace files stay on this device.</li>
+              <li>Local providers such as Ollama and LM Studio can keep analysis on your machine when they are pointed at local servers.</li>
+              <li>Cloud AI providers send prompts and uploaded deck content to the remote endpoint you configure.</li>
+              <li>Some local ML or OCR features may download model files on first use if those assets are not already cached and offline mode is not preconfigured.</li>
+              <li>Grammar review falls back to local regex checks when LanguageTool is unavailable.</li>
             </ul>
+          </section>
+
+          <section>
+            <h3 className="mb-2 font-semibold text-slate-900">Legal Agreements & Documentation</h3>
+            <p className="mb-2 text-xs text-slate-500">
+              The full text of all legal agreements required for distribution, installation, and compliance on Windows is packaged locally in the application's root directory:
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 text-xs">
+              <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
+                <span className="font-semibold text-slate-900 block mb-1">General Terms & Disclaimers</span>
+                <ul className="list-disc list-inside space-y-1 text-slate-600">
+                  <li><code className="text-slate-800 font-mono">legal/TERMS_AND_CONDITIONS.md</code></li>
+                  <li><code className="text-slate-800 font-mono">legal/PRIVACY_NOTICE.md</code></li>
+                </ul>
+              </div>
+              <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
+                <span className="font-semibold text-slate-900 block mb-1">End User License Agreements (EULAs)</span>
+                <ul className="list-disc list-inside space-y-1 text-slate-600">
+                  <li>🇺🇸 <code className="text-slate-800 font-mono">legal/EULA_US.md</code></li>
+                  <li>🇪🇺 <code className="text-slate-800 font-mono">legal/EULA_EU.md</code></li>
+                </ul>
+              </div>
+              <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
+                <span className="font-semibold text-slate-900 block mb-1">Privacy & Compliance</span>
+                <ul className="list-disc list-inside space-y-1 text-slate-600">
+                  <li>🛡️ <code className="text-slate-800 font-mono">legal/GDPR_COMPLIANCE_PRIVACY_POLICY.md</code></li>
+                </ul>
+              </div>
+              <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
+                <span className="font-semibold text-slate-900 block mb-1">Windows Installer & Licenses</span>
+                <ul className="list-disc list-inside space-y-1 text-slate-600">
+                  <li>⚙️ <code className="text-slate-800 font-mono">legal/OPEN_SOURCE_INSTALLER_AGREEMENT.md</code></li>
+                  <li>📜 <code className="text-slate-800 font-mono">legal/OPEN_SOURCE_LICENSES.md</code></li>
+                </ul>
+              </div>
+            </div>
           </section>
         </div>
 
         <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-6 py-4">
-          <p className="text-xs text-slate-500">
-            Acceptance is stored locally on this device.
-          </p>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-xs text-slate-500">
+              Acceptance is stored locally on this device.
+            </p>
+            <p className="text-xs text-slate-400">
+              Connect with Founder: <a href="https://www.arpan-guria.in/" target="_blank" rel="noopener noreferrer" className="text-indigo-600 font-medium hover:underline">Arpan Guria</a>
+            </p>
+          </div>
           <button
             onClick={onAccept}
             className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-black"

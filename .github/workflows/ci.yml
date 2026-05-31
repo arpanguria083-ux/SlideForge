@@ -1,45 +1,77 @@
 name: CI
 
 on:
-  pull_request:
   push:
-    branches: [main]
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
 
 jobs:
-  build-and-test:
+  frontend:
+    name: Frontend (TypeScript + Tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npx tsc --noEmit
+      - run: npx vitest run --reporter=dot
+
+  backend:
+    name: Backend (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - name: Install backend deps
         run: |
           python -m pip install --upgrade pip
           pip install uv
           uv sync --frozen --project backend --all-extras
-
       - name: Run backend tests
         run: |
           cd backend
           python -m pytest -q
+      - name: Build frontend
+        run: npm ci && npm run build
+      - name: Bundle budget check
+        run: npm run check:bundle
 
+  desktop-smoke-windows:
+    name: Windows Desktop smoke test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend deps
+        run: uv sync --frozen --project backend --all-extras
       - name: Install frontend deps
         run: npm ci
-
-      - name: Build frontend
-        run: npm run build
-
-      - name: TypeScript check
-        run: npx tsc --noEmit
+      - name: Build renderer and Electron main
+        run: |
+          npm run build
+          npm run build:electron
+      - name: Build packaged backend
+        run: pwsh backend/build_and_package.ps1 -SkipFrontendBuild
+      - name: Smoke-test packaged backend EXE
+        run: pwsh scripts/smoke-backend-exe.ps1 -ExePath "backend/dist-package/SlideForge/SlideForge.exe"
+      - name: Build desktop zip artifact
+        run: npm run package:full

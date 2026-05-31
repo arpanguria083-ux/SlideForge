@@ -1,4 +1,5 @@
 import importlib
+import time
 
 
 def test_pdf_slide_payload_preserves_ocr_backend_and_text_boxes(tmp_path, monkeypatch):
@@ -22,7 +23,7 @@ def test_pdf_slide_payload_preserves_ocr_backend_and_text_boxes(tmp_path, monkey
                 title="Page 1 (OCR)",
                 width=10.0,
                 height=7.5,
-                ocr_backend="surya",
+                ocr_backend="got_ocr2",
             )
             slide.text_boxes.append(
                 TextBox(
@@ -56,12 +57,13 @@ def test_pdf_slide_payload_preserves_ocr_backend_and_text_boxes(tmp_path, monkey
     pdf_path = uploads_dir / "deck.pdf"
     pdf_path.write_bytes(b"%PDF")
 
+    now = time.time()
     mod.active_sessions[sid] = {
         "deck_path": str(pdf_path),
         "slides_data": [],
         "status": "uploaded",
-        "created_at_ts": 0,
-        "last_access_ts": 0,
+        "created_at_ts": now,
+        "last_access_ts": now,
     }
     mod.session_store.save(sid, mod.active_sessions[sid])
 
@@ -71,7 +73,7 @@ def test_pdf_slide_payload_preserves_ocr_backend_and_text_boxes(tmp_path, monkey
     assert result["status"] == "parsed"
 
     slide_payload = mod.active_sessions[sid]["slides_data"][0]
-    assert slide_payload["ocr_backend"] == "surya"
+    assert slide_payload["ocr_backend"] == "got_ocr2"
     assert len(slide_payload["text_boxes"]) == 1
     assert slide_payload["text_boxes"][0]["id"].startswith("tb_page_0_ocr_")
     persisted = mod.session_store.load(sid)

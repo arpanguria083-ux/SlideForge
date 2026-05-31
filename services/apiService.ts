@@ -2,6 +2,19 @@
 import { ParsedSlideData, SlideAnalysis } from '../types';
 
 const API_BASE = '/api';
+const apiTrace = (event: string, detail: Record<string, unknown>): void => {
+  // Only emit detailed API traces in development to avoid noisy logs in prod
+  try {
+    const meta = (import.meta as any)?.env;
+    const isDev = !!meta && meta.MODE === 'development';
+    if (isDev) {
+      // Use debug so consumers can filter these messages if desired
+      console.debug(`[slideforge-api] ${event}`, detail);
+    }
+  } catch {
+    // If import.meta isn't available (non-Vite env), skip tracing
+  }
+};
 
 const resolveApiBase = (): string => {
   const electronApiBase = window.slideforge?.apiBase;
@@ -13,10 +26,47 @@ const resolveApiBase = (): string => {
 
 class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+  title?: string;
+  hint?: string;
+  context?: ErrorContextPayload;
+
+  constructor(
+    message: string,
+    status: number,
+    details?: {
+      code?: string;
+      title?: string;
+      hint?: string;
+      context?: ErrorContextPayload;
+    }
+  ) {
     super(message);
     this.status = status;
+    this.code = details?.code;
+    this.title = details?.title;
+    this.hint = details?.hint;
+    this.context = details?.context;
   }
+}
+
+interface ErrorContextPayload {
+  requestId?: string | null;
+  timestamp?: string | null;
+  endpoint?: string | null;
+  status?: number;
+  provider?: string;
+  base_url?: string;
+  model?: string;
+  details?: Record<string, unknown>;
+}
+
+interface StructuredErrorPayload {
+  code?: string;
+  title?: string;
+  message?: string;
+  hint?: string;
+  context?: ErrorContextPayload;
 }
 
 interface SessionResponse {
@@ -32,6 +82,8 @@ interface AnalysisResponse {
 
 interface ScorecardResponse {
   session_id: string;
+  job_status?: string;
+  progress_label?: string | null;
   scorecard: {
     composite_score: number;
     structure_score: number;
@@ -228,6 +280,71 @@ interface GrammarStatusResponse {
   notes: string;
 }
 
+interface RuntimeAssetFileStatus {
+  name: string;
+  relative_path: string;
+  size_bytes: number;
+  modified_at: number;
+}
+
+interface OcrRuntimeStatus {
+  phase: string;
+  message: string;
+  download_active: boolean;
+  download_required: boolean;
+  offline_ready: boolean;
+  bundled_seeded: boolean;
+  cache_dir: string | null;
+  tmp_dir: string | null;
+  files: RuntimeAssetFileStatus[];
+  updated_at: number | null;
+  layout_loaded: boolean;
+  recognition_loaded: boolean;
+  detector_loaded: boolean;
+  foundation_loaded: boolean;
+  cooldown_active: boolean;
+  last_error: string | null;
+}
+
+interface RuntimeAssetStatusResponse {
+  ocr: OcrRuntimeStatus;
+  download_active: boolean;
+  download_required: boolean;
+}
+
+interface OcrVariantState {
+  variant: 'full' | 'lite';
+  ready: boolean;
+  bundleAvailable: boolean;
+  runtimeCacheReady: boolean;
+  cacheDir: string;
+}
+
+interface OcrDownloadJobResponse {
+  job_id: string;
+  status: string;
+}
+
+interface OcrJobStatus {
+  job_id: string;
+  // include cancelling/already_running variants that may be returned by some backends
+  status: 'idle' | 'running' | 'completed' | 'failed' | 'cancelled' | 'cancelling' | 'already_running';
+  phase: string;
+  message: string;
+  progress: number;
+  total: number;
+  error?: string | null;
+}
+
+interface AnalysisJobStatusResponse {
+  session_id: string;
+  job_status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  progress_label?: string | null;
+  updated_at?: number;
+  error?: string;
+  scorecard?: ScorecardResponse['scorecard'];
+}
+
 interface RuntimeProviderStatus {
   api_base_url: string;
   base_url: string;
@@ -236,6 +353,102 @@ interface RuntimeProviderStatus {
   requires_api_key: boolean;
   api_key_configured: boolean;
   api_key_preview: string | null;
+}
+
+interface DiagnosticsResponse {
+  status: 'ok' | 'degraded' | string;
+  timestamp: string;
+  request_id?: string | null;
+  backend: {
+    status: string;
+    pid: number;
+    port?: string | null;
+    uptime_seconds: number;
+    app_ready: boolean;
+    app_ready_at?: number | null;
+    active_sessions: number;
+    analysis_jobs: number;
+  };
+  startup: {
+    model_warmup_state: 'idle' | 'loading' | 'ready' | 'error' | string;
+    model_warmup_message?: string | null;
+    model_warmup_error?: string | null;
+    model_warmup_started_at?: number | null;
+    model_warmup_finished_at?: number | null;
+    warmup_task_running: boolean;
+    preflight: {
+      overall: 'OK' | 'WARNING' | 'ERROR' | 'MISSING' | 'UNKNOWN' | string;
+      timestamp?: string | null;
+      checks: Array<{
+        name: string;
+        status: string;
+        message: string;
+      }>;
+    };
+  };
+  llm: {
+    provider: string;
+    configured: boolean;
+    llm_available: boolean;
+    providers: Record<
+      string,
+      RuntimeProviderStatus & {
+        connection?: {
+          ok: boolean;
+          host?: string;
+          port?: number;
+          latency_ms?: number;
+          error?: string;
+        };
+        runtime_hint?: string;
+        is_local?: boolean;
+      }
+    >;
+  };
+  ocr: {
+    state: 'loaded' | 'loading' | 'pending' | 'error' | string;
+    phase: string;
+    message?: string | null;
+    offline_ready: boolean;
+    cache_dir?: string | null;
+    cached_files: number;
+    last_error?: string | null;
+    cooldown_active: boolean;
+    loaded: {
+      layout: boolean;
+      recognition: boolean;
+      detector: boolean;
+      foundation: boolean;
+    };
+  };
+  chromadb: {
+    state: 'not_initialized' | 'initialized' | 'error' | string;
+    collections: number | null;
+    error?: string;
+  };
+  system: {
+    disk: {
+      ok: boolean;
+      total_bytes?: number;
+      used_bytes?: number;
+      free_bytes?: number;
+      error?: string;
+    };
+    memory: {
+      ok: boolean;
+      used_bytes?: number;
+      total_bytes?: number;
+      process_rss_bytes?: number;
+      percent?: number;
+      error?: string;
+    };
+  };
+  analysis: {
+    last_run_at: number | null;
+    last_status: 'idle' | 'running' | 'succeeded' | 'failed' | string;
+    last_session_id: string | null;
+    last_error: string | null;
+  };
 }
 
 interface LlmProviderResponse {
@@ -261,10 +474,13 @@ interface UpdateLlmProviderPayload {
 }
 
 interface TestLlmConnectionResponse {
+  ok?: boolean;
   status: string;
   response: string;
   provider: string;
   model: string;
+  latency_ms?: number;
+  error_message?: string | null;
 }
 
 interface HistoryItem {
@@ -282,7 +498,58 @@ class ApiService {
   private sessionId: string | null = null;
 
   private apiBase = resolveApiBase();
+  private apiBaseResolved = this.apiBase !== API_BASE;
   private readonly defaultTimeoutMs = 60_000;
+
+  private readonly authHeadersCache = {
+    role: '',
+    headers: {} as Record<string, string>,
+  };
+
+  private async buildUrl(path: string): Promise<string> {
+    const base = await this.ensureApiBase();
+    return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  }
+
+  private async fetchWithResolvedBase(
+    path: string,
+    init?: RequestInit,
+    options?: { retries?: number; timeoutMs?: number }
+  ): Promise<Response> {
+    const url = await this.buildUrl(path);
+    const timeoutMs = options?.timeoutMs ?? this.defaultTimeoutMs;
+    const retries = options?.retries ?? 0;
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      const timeoutController = this.abortWithTimeout(timeoutMs);
+      try {
+        const response = await fetch(url, {
+          ...init,
+          signal: timeoutController.signal,
+        });
+        if (!response.ok) {
+          const apiError = await this.parseError(response, 'Request failed');
+          if (attempt < retries && this.shouldRetry(response.status)) {
+            await new Promise((resolve) => window.setTimeout(resolve, 300 * (attempt + 1)));
+            continue;
+          }
+          throw apiError;
+        }
+        return response;
+      } catch (err) {
+        lastError = err;
+        const canRetry = attempt < retries && (!(err instanceof ApiError) || this.shouldRetry(err.status));
+        if (canRetry) {
+          await new Promise((resolve) => window.setTimeout(resolve, 300 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw (lastError instanceof Error ? lastError : new Error('Request failed'));
+  }
 
   private abortWithTimeout(timeoutMs: number): AbortController {
     const controller = new AbortController();
@@ -297,7 +564,7 @@ class ApiService {
     return status === 429 || status >= 500;
   }
 
-  private async fetchJson<T>(
+  private  async fetchJson<T>(
     input: string,
     init?: RequestInit,
     options?: { retries?: number; timeoutMs?: number }
@@ -310,6 +577,7 @@ class ApiService {
       const timeoutController = this.abortWithTimeout(timeoutMs);
       try {
         const mergedHeaders = {
+          ...this.getAuthHeaders(),
           ...((init?.headers as Record<string, string>) || {}),
         };
         const response = await fetch(input, {
@@ -318,15 +586,18 @@ class ApiService {
           signal: timeoutController.signal,
         });
         if (!response.ok) {
-          const message = await this.getErrorMessage(response, 'Request failed');
+          const apiError = await this.parseError(response, 'Request failed');
           if (attempt < retries && this.shouldRetry(response.status)) {
             await new Promise((resolve) => window.setTimeout(resolve, 300 * (attempt + 1)));
             continue;
           }
-          throw new ApiError(message, response.status);
+          throw apiError;
         }
         return (await response.json()) as T;
       } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+        }
         lastError = err;
         const canRetry =
           attempt < retries &&
@@ -345,6 +616,8 @@ class ApiService {
   setApiBase(apiBase: string): void {
     if (apiBase && apiBase.trim()) {
       this.apiBase = `${apiBase.replace(/\/+$/, '')}/api`;
+      this.apiBaseResolved = true;
+      apiTrace('setApiBase', { apiBase: this.apiBase });
     }
   }
 
@@ -352,99 +625,242 @@ class ApiService {
     return this.apiBase;
   }
 
+  private async ensureApiBase(): Promise<string> {
+    if (!this.apiBaseResolved && window.slideforge?.getApiBase) {
+      const base = window.slideforge.apiBase?.trim() || (await window.slideforge.getApiBase());
+      if (base && base.trim()) {
+        this.setApiBase(base);
+      }
+    }
+    apiTrace('ensureApiBase', {
+      resolved: this.apiBaseResolved,
+      apiBase: this.apiBase,
+      electronApiBase: window.slideforge?.apiBase || null,
+    });
+    return this.apiBase;
+  }
+
   private async getErrorMessage(response: Response, fallback: string): Promise<string> {
     try {
       const json = await response.json();
-      return json.detail || fallback;
+      const detail = json?.detail;
+      if (detail && typeof detail === 'object') {
+        const structured = detail as StructuredErrorPayload;
+        return structured.message || structured.title || fallback;
+      }
+      if (typeof detail === 'string') {
+        return detail;
+      }
+      return fallback;
     } catch {
       return fallback;
     }
   }
 
+  private async parseError(response: Response, fallback: string): Promise<ApiError> {
+    try {
+      const json = await response.json();
+      const detail = json?.detail;
+      if (detail && typeof detail === 'object') {
+        const structured = detail as StructuredErrorPayload;
+        return new ApiError(structured.message || structured.title || fallback, response.status, {
+          code: structured.code,
+          title: structured.title,
+          hint: structured.hint,
+          context: structured.context,
+        });
+      }
+      if (typeof detail === 'string') {
+        return new ApiError(detail, response.status);
+      }
+      return new ApiError(fallback, response.status);
+    } catch {
+      return new ApiError(fallback, response.status);
+    }
+  }
+
   async createSession(clientNamespace?: string): Promise<string> {
-    const base = this.apiBase;
+    const base = await this.ensureApiBase();
     const url = clientNamespace 
       ? `${base}/session/create?client_namespace=${encodeURIComponent(clientNamespace)}`
       : `${base}/session/create`;
 
+    apiTrace('createSession:start', { url, clientNamespace: clientNamespace || null });
+
     const data = await this.fetchJson<SessionResponse>(url, { method: 'POST' }, { retries: 1 });
     this.sessionId = data.session_id;
+    apiTrace('createSession:success', { url, sessionId: data.session_id });
     return data.session_id;
   }
 
   async uploadDeck(sessionId: string, file: File): Promise<{document_fingerprint: string; history_available: boolean}> {
+    const base = await this.ensureApiBase();
     const formData = new FormData();
     formData.append('file', file);
+    const url = `${base}/session/${sessionId}/upload`;
+    apiTrace('uploadDeck:start', {
+      url,
+      sessionId,
+      fileName: file.name,
+      fileSize: file.size,
+      fileType: file.type,
+    });
 
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/upload`, {
+    const response = await fetch(url, {
       method: 'POST',
       body: formData,
     });
 
     if (!response.ok) {
-      throw new Error(await this.getErrorMessage(response, 'Failed to upload deck'));
+      const message = await this.getErrorMessage(response, 'Failed to upload deck');
+      apiTrace('uploadDeck:error', { url, sessionId, status: response.status, message });
+      throw new Error(message);
     }
-    return response.json();
+    const payload = await response.json();
+    apiTrace('uploadDeck:success', { url, sessionId, payload });
+    return payload;
   }
 
   async parseDeck(sessionId: string): Promise<AnalysisResponse> {
-    return this.fetchJson<AnalysisResponse>(`${this.apiBase}/session/${sessionId}/analyze`, {
+    const base = await this.ensureApiBase();
+    const url = `${base}/session/${sessionId}/analyze`;
+    apiTrace('parseDeck:start', { url, sessionId });
+    const payload = await this.fetchJson<AnalysisResponse>(url, {
       method: 'POST',
-    }, { retries: 1, timeoutMs: 120_000 });
+    }, { retries: 1, timeoutMs: 600_000 });
+    apiTrace('parseDeck:success', { url, sessionId, payload });
+    return payload;
   }
 
   async runAnalysis(sessionId: string): Promise<ScorecardResponse> {
-    return this.fetchJson<ScorecardResponse>(`${this.apiBase}/session/${sessionId}/run-analysis`, {
+    const base = await this.ensureApiBase();
+    const url = `${base}/session/${sessionId}/run-analysis`;
+    apiTrace('runAnalysis:start', { url, sessionId });
+    // Analysis can take a long time to start (model warmup, resource contention)
+    // Allow a longer timeout here so the client doesn't abort while the server
+    // queues the job and returns. The endpoint is designed to queue and return
+    // quickly, but in practice large uploads or lock contention can delay the
+    // response — increase to 20 minutes to handle large PDFs with OCR.
+    const payload = await this.fetchJson<ScorecardResponse>(url, {
       method: 'POST',
-    }, { retries: 1, timeoutMs: 180_000 });
+    }, { retries: 0, timeoutMs: 1200_000 });
+    apiTrace('runAnalysis:success', { url, sessionId, annotationCount: payload.scorecard?.annotations?.length ?? 0 });
+    return payload;
+  }
+
+  async getAnalysisStatus(sessionId: string): Promise<AnalysisJobStatusResponse> {
+    return this.fetchJson<AnalysisJobStatusResponse>(await this.buildUrl(`/session/${sessionId}/run-analysis/status`), {
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 30_000 });
+  }
+
+  async runAnalysisWithPolling(
+    sessionId: string,
+    options?: { pollIntervalMs?: number; pollTimeoutMs?: number; onProgress?: (status: AnalysisJobStatusResponse) => void }
+  ): Promise<ScorecardResponse> {
+    // Try to start the analysis. If the client-side request times out while the
+    // server is queuing or warming up, fall back to polling the status endpoint
+    // instead of failing immediately.
+    try {
+      const initial = await this.runAnalysis(sessionId);
+      if (initial && initial.scorecard) {
+        return initial;
+      }
+    } catch (err: any) {
+      const msg = err?.message || '';
+      if (msg.includes('Request timed out') || msg.toLowerCase().includes('timeout')) {
+        apiTrace('runAnalysisWithPolling:runAnalysis_timeout', { sessionId, message: msg });
+        // continue to polling fallback below
+      } else {
+        throw err;
+      }
+    }
+
+    const pollIntervalMs = options?.pollIntervalMs ?? 2000;
+    const startedAt = Date.now();
+    const maxWaitMs = (options?.pollTimeoutMs && options.pollTimeoutMs > 0)
+      ? options.pollTimeoutMs
+      : 20 * 60_000; // default 20 minutes
+
+    for (;;) {
+      try {
+        const status = await this.getAnalysisStatus(sessionId);
+        options?.onProgress?.(status);
+        if (status.job_status === 'completed' && status.scorecard) {
+          return {
+            session_id: sessionId,
+            scorecard: status.scorecard,
+            job_status: status.job_status,
+            progress_label: status.progress_label,
+          };
+        }
+        if (status.job_status === 'failed') {
+          throw new Error(status.error || 'Analysis failed');
+        }
+      } catch (err: any) {
+        const isRealFailure = err?.message === 'Analysis failed' || (err instanceof Error && !err.message.includes('timed out') && !err.message.includes('Fetch') && !err.message.includes('Failed to fetch'));
+        if (isRealFailure) {
+          throw err;
+        }
+        console.warn('[slideforge-api] Analysis status poll failed (retrying):', err);
+      }
+      if (Date.now() - startedAt > maxWaitMs) {
+        throw new Error(`Analysis polling timed out after ${Math.round(maxWaitMs / 1000)}s`);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, pollIntervalMs));
+    }
   }
 
   async getScorecard(sessionId: string): Promise<ScorecardResponse['scorecard']> {
-    return this.fetchJson<ScorecardResponse['scorecard']>(`${this.apiBase}/session/${sessionId}/scorecard`, undefined, { retries: 1 });
+    const base = await this.ensureApiBase();
+    return this.fetchJson<ScorecardResponse['scorecard']>(`${base}/session/${sessionId}/scorecard`, undefined, { retries: 1 });
   }
 
   async getSlides(sessionId: string): Promise<SlidesResponse> {
-    return this.fetchJson<SlidesResponse>(`${this.apiBase}/session/${sessionId}/slides`, undefined, { retries: 1 });
+    const base = await this.ensureApiBase();
+    return this.fetchJson<SlidesResponse>(`${base}/session/${sessionId}/slides`, undefined, { retries: 1 });
   }
 
   async getSlideAnalysis(sessionId: string, slideIndex: number): Promise<SlideAnalysis | null> {
     try {
-      const response = await fetch(`${this.apiBase}/session/${sessionId}/slide/${slideIndex}/analysis`, {
+      const response = await this.fetchWithResolvedBase(`/session/${sessionId}/slide/${slideIndex}/analysis`, {
         headers: this.getAuthHeaders()
       });
-      
-      if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to fetch slide analysis'));
-      
+
       const data = await response.json();
       return data;
     } catch (err) {
+      // 404 means analysis not yet ready; return null gracefully.
+      // All other errors (network, 5xx) should propagate so callers can show error UI.
+      if (err instanceof ApiError && err.status === 404) {
+        return null;
+      }
       console.error('Error fetching slide analysis:', err);
-      return null;
+      throw err;
     }
   }
-
-  async rerunSlideDeepAnalysis(sessionId: string, slideIndex: number): Promise<{status: string; session_id: string; slide_index: number}> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/slide/${slideIndex}/deep-analysis`, {
+async rerunSlideDeepAnalysis(sessionId: string, slideIndex: number): Promise<{status: string; session_id: string; slide_index: number}> {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/slide/${slideIndex}/deep-analysis`, {
       method: 'POST',
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to rerun slide deep analysis'));
     return response.json();
   }
 
   async getLlmProvider(): Promise<LlmProviderResponse> {
-    return this.fetchJson<LlmProviderResponse>(`${this.apiBase}/settings/local-llm`, undefined, { retries: 1 });
+    const base = await this.ensureApiBase();
+    return this.fetchJson<LlmProviderResponse>(`${base}/settings/local-llm`, undefined, { retries: 1 });
   }
 
   async getAnalysisSettings(): Promise<AnalysisSettingsResponse> {
-    return this.fetchJson<AnalysisSettingsResponse>(`${this.apiBase}/settings/analysis`, {
+    return this.fetchJson<AnalysisSettingsResponse>(await this.buildUrl('/settings/analysis'), {
       headers: this.getAuthHeaders()
     }, { retries: 1 });
   }
 
   async updateAnalysisSettings(analysisMaxTokens: number): Promise<AnalysisSettingsResponse & {status: string}> {
     return this.fetchJson<AnalysisSettingsResponse & {status: string}>(
-      `${this.apiBase}/settings/analysis?analysis_max_tokens=${encodeURIComponent(String(analysisMaxTokens))}`,
+      await this.buildUrl(`/settings/analysis?analysis_max_tokens=${encodeURIComponent(String(analysisMaxTokens))}`),
       {
         method: 'POST',
         headers: this.getAuthHeaders()
@@ -454,46 +870,131 @@ class ApiService {
   }
 
   async getGrammarStatus(): Promise<GrammarStatusResponse> {
-    return this.fetchJson<GrammarStatusResponse>(`${this.apiBase}/settings/grammar-status`, {
+    return this.fetchJson<GrammarStatusResponse>(await this.buildUrl('/settings/grammar-status'), {
       headers: this.getAuthHeaders()
     }, { retries: 1 });
   }
 
+  async getRuntimeAssetStatus(): Promise<RuntimeAssetStatusResponse> {
+    return this.fetchJson<RuntimeAssetStatusResponse>(await this.buildUrl('/settings/runtime-assets'), {
+      headers: this.getAuthHeaders()
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async getOcrVariantState(): Promise<OcrVariantState> {
+    return this.fetchJson<OcrVariantState>(await this.buildUrl('/settings/ocr-variant'), {
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async startOcrDownload(backendId?: string): Promise<OcrDownloadJobResponse> {
+    const params = backendId ? `?backend=${encodeURIComponent(backendId)}` : '';
+    return this.fetchJson<OcrDownloadJobResponse>(await this.buildUrl(`/ocr/download${params}`), {
+      method: 'POST',
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async getOcrDownloadStatus(jobId?: string): Promise<OcrJobStatus> {
+    const suffix = jobId ? `/job/${encodeURIComponent(jobId)}` : '/status';
+    return this.fetchJson<OcrJobStatus>(await this.buildUrl(`/ocr${suffix}`), {
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async getOcrBackends(): Promise<import('../types').OcrBackendsResponse> {
+    return this.fetchJson<import('../types').OcrBackendsResponse>(await this.buildUrl('/ocr/backends'), {
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 30_000 });
+  }
+
+  async detectOcrDevice(): Promise<import('../types').OcrDeviceCapabilities> {
+    return this.fetchJson<import('../types').OcrDeviceCapabilities>(await this.buildUrl('/ocr/detect-device'), {
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 30_000 });
+  }
+
+  async cancelOcrDownload(jobId: string): Promise<Record<string, unknown>> {
+    return this.fetchJson<Record<string, unknown>>(await this.buildUrl(`/ocr/cancel?job_id=${encodeURIComponent(jobId)}`), {
+      method: 'POST',
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async activateOcrBackend(backendId: string): Promise<{ activated: boolean; backend_id: string; label: string }> {
+    return this.fetchJson(await this.buildUrl(`/ocr/activate?backend=${encodeURIComponent(backendId)}`), {
+      method: 'POST',
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async clearOcrCache(backendId?: string): Promise<{ removed: string[]; errors: string[] }> {
+    const params = backendId ? `?backend=${encodeURIComponent(backendId)}` : '';
+    return this.fetchJson(await this.buildUrl(`/ocr/cache${params}`), {
+      method: 'DELETE',
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
+  async forceRedownloadOcr(backendId?: string): Promise<OcrDownloadJobResponse> {
+    const params = backendId ? `?backend=${encodeURIComponent(backendId)}` : '';
+    return this.fetchJson<OcrDownloadJobResponse>(await this.buildUrl(`/ocr/force-download${params}`), {
+      method: 'POST',
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
+  }
+
   async setLlmProvider(payload: UpdateLlmProviderPayload): Promise<LlmProviderResponse & {status: string}> {
-    const response = await fetch(`${this.apiBase}/settings/local-llm`, {
+    const response = await this.fetchWithResolvedBase('/settings/local-llm', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to set LLM provider'));
     return response.json();
   }
 
   async setSessionLlmSettings(sessionId: string, provider: string, contextWindow?: number | null): Promise<any> {
+    const base = await this.ensureApiBase();
     const params = new URLSearchParams({ provider });
     if (contextWindow) {
       params.set('context_window', String(contextWindow));
     }
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/llm-settings?${params.toString()}`, {
+    const url = `${base}/session/${sessionId}/llm-settings?${params.toString()}`;
+    apiTrace('setSessionLlmSettings:start', { url, sessionId, provider, contextWindow: contextWindow ?? null });
+    const response = await fetch(url, {
       method: 'POST',
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to save session LLM settings'));
-    return response.json();
+    if (!response.ok) {
+      const message = await this.getErrorMessage(response, 'Failed to save session LLM settings');
+      apiTrace('setSessionLlmSettings:error', { url, sessionId, status: response.status, message });
+      throw new Error(message);
+    }
+    const payload = await response.json();
+    apiTrace('setSessionLlmSettings:success', { url, sessionId, payload });
+    return payload;
   }
 
   async testLlmConnection(): Promise<TestLlmConnectionResponse> {
-    return this.fetchJson<TestLlmConnectionResponse>(`${this.apiBase}/settings/local-llm/test`, undefined, { retries: 0, timeoutMs: 30_000 });
+    const base = await this.ensureApiBase();
+    return this.fetchJson<TestLlmConnectionResponse>(`${base}/settings/local-llm/test`, undefined, { retries: 0, timeoutMs: 30_000 });
   }
 
   getSlideImageUrl(sessionId: string, index: number): string {
     return `${this.apiBase}/session/${sessionId}/slide/${index}/image`;
   }
 
+  resolveAssetUrl(pathOrUrl?: string | null): string | null {
+    if (!pathOrUrl) return null;
+    if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+    if (!pathOrUrl.startsWith('/')) return pathOrUrl;
+    return `${this.apiBase}${pathOrUrl.replace(/^\/api/, '')}`;
+  }
+
   async acceptFix(sessionId: string, annotationId: string): Promise<any> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/accept`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/accept`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
@@ -501,12 +1002,11 @@ class ApiService {
       },
       body: JSON.stringify({ annotation_id: annotationId }),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to accept fix'));
     return response.json();
   }
 
   async dismissAnnotation(sessionId: string, annotationId: string, reason: string): Promise<any> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/override`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/override`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
@@ -514,29 +1014,26 @@ class ApiService {
       },
       body: JSON.stringify({ annotation_id: annotationId, reason }),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to dismiss annotation'));
     return response.json();
   }
 
   async prepareDelivery(sessionId: string): Promise<any> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/prepare`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/prepare`, {
       method: 'POST',
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to prepare delivery'));
     return response.json();
   }
 
   async getDeliveryStatus(sessionId: string): Promise<DeliveryStatusResponse> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/delivery-status`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/delivery-status`, {
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to fetch delivery status'));
     return response.json();
   }
 
   async signGuardrail(sessionId: string, userName: string): Promise<any> {
-    const response = await fetch(`${this.apiBase}/guardrail/${sessionId}/sign`, {
+    const response = await this.fetchWithResolvedBase(`/guardrail/${sessionId}/sign`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
@@ -544,15 +1041,13 @@ class ApiService {
       },
       body: JSON.stringify({ user_name: userName }),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to sign guardrail'));
     return response.json();
   }
 
   async getSessionGuardrail(sessionId: string): Promise<GuardrailResponse> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/guardrail`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/guardrail`, {
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to fetch guardrail'));
     return response.json();
   }
 
@@ -560,7 +1055,7 @@ class ApiService {
     sessionId: string,
     guardrail: GuardrailResponse | Record<string, unknown>
   ): Promise<ApplyGuardrailResponse> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/guardrail/apply`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/guardrail/apply`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -568,29 +1063,26 @@ class ApiService {
       },
       body: JSON.stringify(guardrail),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to apply guardrail to session'));
     return response.json();
   }
 
   async listGuardrails(sessionId: string): Promise<GuardrailListResponse> {
-    const response = await fetch(`${this.apiBase}/guardrail/list?session_id=${encodeURIComponent(sessionId)}`, {
+    const response = await this.fetchWithResolvedBase(`/guardrail/list?session_id=${encodeURIComponent(sessionId)}`, {
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to list guardrails'));
     return response.json();
   }
 
   async diffGuardrails(sessionId: string, oldId: string, newId: string): Promise<GuardrailDiffResponse> {
     const params = new URLSearchParams({ session_id: sessionId, old_id: oldId, new_id: newId });
-    const response = await fetch(`${this.apiBase}/guardrail/diff?${params.toString()}`, {
+    const response = await this.fetchWithResolvedBase(`/guardrail/diff?${params.toString()}`, {
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to diff guardrails'));
     return response.json();
   }
 
   async saveGuardrailTemplate(sessionId: string, templateName: string): Promise<any> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/guardrail/template/save`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/guardrail/template/save`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -598,56 +1090,50 @@ class ApiService {
       },
       body: JSON.stringify({ template_name: templateName }),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to save guardrail template'));
     return response.json();
   }
 
   async listGuardrailTemplates(sessionId?: string): Promise<GuardrailTemplateListResponse> {
     const suffix = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
-    const response = await fetch(`${this.apiBase}/guardrail/template/list${suffix}`, {
+    const response = await this.fetchWithResolvedBase(`/guardrail/template/list${suffix}`, {
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to list guardrail templates'));
     return response.json();
   }
 
   async activateGuardrailTemplate(sessionId: string, templateId: string): Promise<ApplyGuardrailResponse> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/guardrail/template/${encodeURIComponent(templateId)}/activate`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/guardrail/template/${encodeURIComponent(templateId)}/activate`, {
       method: 'POST',
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to activate guardrail template'));
     return response.json();
   }
 
   async getAuditLog(sessionId: string): Promise<{entries: AuditLogEntry[]}> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/audit-log`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/audit-log`, {
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to fetch audit log'));
     return response.json();
   }
 
   async startDiscovery(sessionId: string): Promise<DiscoveryResponse> {
-    const response = await fetch(`${this.apiBase}/template/discover/start?session_id=${sessionId}`, {
+    const response = await this.fetchWithResolvedBase(`/template/discover/start?session_id=${sessionId}`, {
       method: 'POST',
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to start discovery'));
     return response.json();
   }
 
   async answerDiscovery(sessionId: string, answer: string): Promise<DiscoveryResponse> {
-    const response = await fetch(`${this.apiBase}/template/discover/answer?session_id=${sessionId}&answer=${encodeURIComponent(answer)}`, {
+    const response = await this.fetchWithResolvedBase(`/template/discover/answer?session_id=${sessionId}&answer=${encodeURIComponent(answer)}`, {
       method: 'POST',
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to answer discovery question'));
     return response.json();
   }
 
   async discoverTemplateFromPlaybook(playbookText: string, engagementType = 'strategy'): Promise<GuardrailResponse | Record<string, unknown>> {
-    const response = await fetch(`${this.apiBase}/template/discover`, {
+    const response = await this.fetchWithResolvedBase('/template/discover', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -655,7 +1141,6 @@ class ApiService {
       },
       body: JSON.stringify({ playbook_text: playbookText, engagement_type: engagementType })
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to discover guardrails from playbook'));
     return response.json();
   }
 
@@ -667,18 +1152,21 @@ class ApiService {
     const formData = new FormData();
     formData.append('file', file);
     const params = new URLSearchParams({ session_id: sessionId, engagement_type: engagementType });
-    const response = await fetch(`${this.apiBase}/template/discover/upload?${params.toString()}`, {
+    const response = await this.fetchWithResolvedBase(`/template/discover/upload?${params.toString()}`, {
       method: 'POST',
       body: formData,
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to discover guardrails from uploaded playbook'));
     return response.json();
   }
 
   private getAuthHeaders(): Record<string, string> {
     const role = localStorage.getItem('slideforge_role') || 'junior';
-    return { 'X-User-Role': role };
+    if (this.authHeadersCache.role !== role) {
+      this.authHeadersCache.role = role;
+      this.authHeadersCache.headers = { 'X-User-Role': role };
+    }
+    return this.authHeadersCache.headers;
   }
 
   getSessionId(): string | null {
@@ -686,10 +1174,9 @@ class ApiService {
   }
 
   async downloadAnnotated(sessionId: string): Promise<void> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/download`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/download`, {
       headers: this.getAuthHeaders()
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to download annotated deck'));
     const blob = await response.blob();
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -702,8 +1189,7 @@ class ApiService {
   }
 
   async downloadPackage(sessionId: string): Promise<void> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/download-package`);
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to download package'));
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/download-package`);
     const blob = await response.blob();
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -716,7 +1202,7 @@ class ApiService {
   }
 
   async signOffSession(sessionId: string, userName: string): Promise<any> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/sign-off`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/sign-off`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -724,72 +1210,74 @@ class ApiService {
       },
       body: JSON.stringify({ user_name: userName }),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to sign off'));
     return response.json();
   }
 
   async uploadSourceDocument(sessionId: string, file: File): Promise<any> {
     const formData = new FormData();
     formData.append('file', file);
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/upload-source`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/upload-source`, {
       method: 'POST',
       body: formData,
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to upload source document'));
     return response.json();
   }
 
   async uploadExcelForDataLineage(sessionId: string, file: File): Promise<UploadExcelResponse> {
     const formData = new FormData();
     formData.append('file', file);
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/upload-excel`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/upload-excel`, {
       method: 'POST',
       body: formData,
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to upload Excel source'));
     return response.json();
   }
 
   async getSessionEvidence(sessionId: string): Promise<SessionEvidenceResponse> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/evidence`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/evidence`, {
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to load evidence state'));
     return response.json();
   }
 
   async runRevisionLoop(sessionId: string): Promise<RevisionLoopResponse> {
-    const response = await fetch(`${this.apiBase}/session/${sessionId}/revision`, {
+    const response = await this.fetchWithResolvedBase(`/session/${sessionId}/revision`, {
       method: 'POST',
       headers: this.getAuthHeaders(),
     });
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to run revision loop'));
     return response.json();
   }
 
   async getLlmDiagnostics(): Promise<any> {
-    const response = await fetch(`${this.apiBase}/settings/local-llm/diagnostics`);
-    if (!response.ok) throw new Error(await this.getErrorMessage(response, 'Failed to get diagnostics'));
+    const response = await this.fetchWithResolvedBase('/settings/local-llm/diagnostics');
     return response.json();
+  }
+
+  async getDiagnostics(): Promise<DiagnosticsResponse> {
+    return this.fetchJson<DiagnosticsResponse>(await this.buildUrl('/diagnostics'), {
+      headers: this.getAuthHeaders(),
+    }, { retries: 0, timeoutMs: 60_000 });
   }
 
   async getSessionMetrics(includeSessions = false): Promise<SessionMetricsResponse> {
     return this.fetchJson<SessionMetricsResponse>(
-      `${this.apiBase}/admin/session-metrics?include_sessions=${includeSessions ? 'true' : 'false'}`,
+      await this.buildUrl(`/admin/session-metrics?include_sessions=${includeSessions ? 'true' : 'false'}`),
       { headers: this.getAuthHeaders() },
       { retries: 1 }
     );
   }
 
   async getRecentHistory(limit = 12): Promise<{items: HistoryItem[]}> {
-    return this.fetchJson<{items: HistoryItem[]}>(`${this.apiBase}/history/recent?limit=${limit}`, {
+    const base = await this.ensureApiBase();
+    return this.fetchJson<{items: HistoryItem[]}>(`${base}/history/recent?limit=${limit}`, {
       headers: this.getAuthHeaders()
     }, { retries: 1 });
   }
 
   async openHistory(fingerprint: string): Promise<AnalysisResponse> {
-    return this.fetchJson<AnalysisResponse>(`${this.apiBase}/history/${encodeURIComponent(fingerprint)}/open`, {
+    const base = await this.ensureApiBase();
+    return this.fetchJson<AnalysisResponse>(`${base}/history/${encodeURIComponent(fingerprint)}/open`, {
       method: 'POST',
       headers: this.getAuthHeaders()
     }, { retries: 1, timeoutMs: 120_000 });
@@ -797,7 +1285,12 @@ class ApiService {
 }
 
 export const apiService = new ApiService();
+export { ApiError };
+
 export type {
+  ErrorContextPayload,
+  StructuredErrorPayload,
+  DiagnosticsResponse,
   Annotation,
   SlideData,
   HistoryItem,

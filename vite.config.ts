@@ -11,7 +11,7 @@ export default defineConfig(({ mode }) => {
         host: '127.0.0.1',
         proxy: {
           '/api': {
-            target: 'http://127.0.0.1:8002',
+            target: 'http://127.0.0.1:8000',
             changeOrigin: true,
             rewrite: (path) => path,
           },
@@ -22,6 +22,7 @@ export default defineConfig(({ mode }) => {
         rollupOptions: {
           output: {
             manualChunks: {
+              query: ['@tanstack/react-query'],
               charts: ['recharts'],
             },
           },

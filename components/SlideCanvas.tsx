@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { SlideAnalysis, BoundingBox, ParsedSlideData } from '../types';
 import { Eye, EyeOff, AlertCircle, Info, Monitor, Image as ImageIcon } from 'lucide-react';
+import { apiService } from '../services/apiService';
 
 interface EnhancedBoundingBox extends BoundingBox {
   severity?: string;
@@ -74,19 +75,98 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
   );
 
   useEffect(() => {
-    if (browserRenderable) {
+    if (imageUrl) {
+      setRenderMode('image');
+    } else if (browserRenderable) {
       setRenderMode('browser');
     } else {
       setRenderMode('image');
     }
-  }, [browserRenderable, slideData?.id]);
+  }, [imageUrl, browserRenderable, slideData?.id]);
 
   const getVisualBadge = (label: string) => {
     const normalized = label.toLowerCase();
+    if (normalized === 'page-header') return 'Page-Header';
+    if (normalized === 'page-footer') return 'Page-Footer';
+    if (normalized === 'diagram') return 'Diagram';
+    if (normalized === 'caption') return 'Caption';
+    if (normalized === 'text') return 'Text';
     if (normalized.includes('table')) return 'Table';
     if (normalized.includes('chart')) return 'Chart';
     if (normalized.includes('image') || normalized.includes('figure')) return 'Image';
     return 'Visual';
+  };
+
+  const getVisualColors = (label: string) => {
+    const normalized = label.toLowerCase();
+    if (normalized.includes('page-header')) {
+      return {
+        border: 'border-orange-400',
+        bg: 'bg-orange-500/8',
+        bgHover: 'hover:bg-orange-500/18',
+        badgeBg: 'bg-orange-500/90',
+        highlightBorder: 'border-orange-600 ring-orange-300 bg-orange-500/22',
+        tooltipBg: 'bg-orange-700'
+      };
+    }
+    if (normalized.includes('page-footer')) {
+      return {
+        border: 'border-rose-400',
+        bg: 'bg-rose-500/8',
+        bgHover: 'hover:bg-rose-500/18',
+        badgeBg: 'bg-rose-500/90',
+        highlightBorder: 'border-rose-600 ring-rose-300 bg-rose-500/22',
+        tooltipBg: 'bg-rose-700'
+      };
+    }
+    if (normalized.includes('diagram')) {
+      return {
+        border: 'border-pink-400',
+        bg: 'bg-pink-500/8',
+        bgHover: 'hover:bg-pink-500/18',
+        badgeBg: 'bg-pink-600/90',
+        highlightBorder: 'border-pink-600 ring-pink-300 bg-pink-500/22',
+        tooltipBg: 'bg-pink-700'
+      };
+    }
+    if (normalized.includes('caption')) {
+      return {
+        border: 'border-purple-400',
+        bg: 'bg-purple-500/8',
+        bgHover: 'hover:bg-purple-500/18',
+        badgeBg: 'bg-purple-600/90',
+        highlightBorder: 'border-purple-600 ring-purple-300 bg-purple-500/22',
+        tooltipBg: 'bg-purple-700'
+      };
+    }
+    if (normalized.includes('table')) {
+      return {
+        border: 'border-emerald-400',
+        bg: 'bg-emerald-500/8',
+        bgHover: 'hover:bg-emerald-500/18',
+        badgeBg: 'bg-emerald-600/90',
+        highlightBorder: 'border-emerald-600 ring-emerald-300 bg-emerald-500/22',
+        tooltipBg: 'bg-emerald-700'
+      };
+    }
+    if (normalized.includes('text')) {
+      return {
+        border: 'border-cyan-400',
+        bg: 'bg-cyan-500/8',
+        bgHover: 'hover:bg-cyan-500/18',
+        badgeBg: 'bg-cyan-600/90',
+        highlightBorder: 'border-cyan-600 ring-cyan-300 bg-cyan-500/22',
+        tooltipBg: 'bg-cyan-700'
+      };
+    }
+    return {
+      border: 'border-indigo-400/50',
+      bg: 'bg-indigo-400/5',
+      bgHover: 'hover:bg-indigo-400/15',
+      badgeBg: 'bg-indigo-700/90',
+      highlightBorder: 'border-indigo-500 ring-indigo-300 bg-indigo-400/20',
+      tooltipBg: 'bg-indigo-700'
+    };
   };
 
   const toPercent = (value: number, total: number) => {
@@ -100,7 +180,8 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
   };
 
   const canRenderAsset = (assetUrl?: string | null, contentType?: string | null, extension?: string | null) => {
-    if (!assetUrl) return false;
+    const resolvedAssetUrl = apiService.resolveAssetUrl(assetUrl);
+    if (!resolvedAssetUrl) return false;
     const loweredExt = (extension || '').toLowerCase();
     const loweredType = (contentType || '').toLowerCase();
     return (
@@ -115,14 +196,16 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
       const container = imageContainerRef.current;
       const image = imageElementRef.current;
       if (!container || !image) {
-        setImageBox(null);
+        // Use percentage fallback instead of null to prevent rendering flicker
+        setImageBox({ left: 0, top: 0, width: 0, height: 0 });
         return;
       }
 
       const containerRect = container.getBoundingClientRect();
       const imageRect = image.getBoundingClientRect();
       if (imageRect.width <= 0 || imageRect.height <= 0) {
-        setImageBox(null);
+        // Use percentage fallback instead of null to prevent rendering flicker
+        setImageBox({ left: 0, top: 0, width: 0, height: 0 });
         return;
       }
 
@@ -140,7 +223,11 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
   }, [imageUrl, renderMode, browserRenderable]);
 
   const overlayStyleForImageMode = (box: BoundingBox) => {
-    if (!imageBox || imageBox.width <= 0 || imageBox.height <= 0) {
+    // Always use percentage-based positioning as primary (works during image load)
+    // This prevents flicker during the timing window before imageBox is calculated
+    const hasValidImageBox = imageBox && imageBox.width > 0 && imageBox.height > 0;
+    
+    if (!hasValidImageBox) {
       return {
         top: `${box.top}%`,
         left: `${box.left}%`,
@@ -149,6 +236,7 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
       };
     }
 
+    // Convert percentage coordinates to pixels using imageBox measurements
     const topPx = imageBox.top + (box.top / 100) * imageBox.height;
     const leftPx = imageBox.left + (box.left / 100) * imageBox.width;
     const widthPx = (box.width / 100) * imageBox.width;
@@ -236,7 +324,10 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
             className="relative w-full max-w-4xl shadow-lg rounded-lg overflow-hidden bg-white"
             style={{ aspectRatio: `${slideData.width} / ${slideData.height}` }}
           >
-            <div className="absolute inset-0 bg-white">
+            <div 
+              className="absolute inset-0 bg-white bg-cover bg-no-repeat bg-center"
+              style={imageUrl ? { backgroundImage: `url(${imageUrl})` } : undefined}
+            >
               {slideData.text_boxes.map((box) => {
                 const firstRun = box.runs?.[0];
                 return (
@@ -278,7 +369,7 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
                   >
                     {assetRenderable ? (
                       <img
-                        src={image.asset_url || ''}
+                        src={apiService.resolveAssetUrl(image.asset_url) || ''}
                         alt={image.id}
                         className="w-full h-full object-contain"
                       />
@@ -326,33 +417,39 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
 
             {analysis && (
               <div className="absolute inset-0 pointer-events-none">
-                {showVisuals && visuals.map((box, idx) => (
-                  <div
-                    key={`vis-${idx}`}
-                    style={{
-                      top: `${box.top}%`,
-                      left: `${box.left}%`,
-                      width: `${box.width}%`,
-                      height: `${box.height}%`,
-                    }}
-                    className={`absolute border-2 border-indigo-400/50 bg-indigo-400/5 transition-all duration-200 pointer-events-auto cursor-pointer ${
-                      hoveredVisual === idx || highlightedVisualKey === box.visualKey ? 'bg-indigo-400/20 border-indigo-500 z-20 ring-2 ring-indigo-300' : ''
-                    }`}
-                    onMouseEnter={() => setHoveredVisual(idx)}
-                    onMouseLeave={() => setHoveredVisual(null)}
-                    onClick={() => onVisualClick?.(box.visualKey, idx)}
-                  >
-                    <div className="absolute top-1 left-1 bg-indigo-700/90 text-white text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide shadow-sm">
-                      {getVisualBadge(box.label)}
-                    </div>
-                    {(hoveredVisual === idx || highlightedVisualKey === box.visualKey) && (
-                      <div className="absolute -top-7 left-0 bg-indigo-700 text-white text-[10px] px-2.5 py-1 rounded-md shadow-lg whitespace-nowrap z-30 font-medium backdrop-blur-sm">
-                        <Info className="w-2.5 h-2.5 inline mr-1 -mt-0.5" />
-                        {box.label}
+                {showVisuals && visuals.map((box, idx) => {
+                  const colors = getVisualColors(box.label);
+                  const isHighlighted = hoveredVisual === idx || highlightedVisualKey === box.visualKey;
+                  return (
+                    <div
+                      key={`vis-${idx}`}
+                      style={{
+                        top: `${box.top}%`,
+                        left: `${box.left}%`,
+                        width: `${box.width}%`,
+                        height: `${box.height}%`,
+                      }}
+                      className={`absolute border-2 transition-all duration-200 pointer-events-auto cursor-pointer ${
+                        isHighlighted 
+                          ? `${colors.highlightBorder} z-20 ring-2` 
+                          : `${colors.border} ${colors.bg} ${colors.bgHover}`
+                      }`}
+                      onMouseEnter={() => setHoveredVisual(idx)}
+                      onMouseLeave={() => setHoveredVisual(null)}
+                      onClick={() => onVisualClick?.(box.visualKey, idx)}
+                    >
+                      <div className={`absolute top-1 left-1 ${colors.badgeBg} text-white text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide shadow-sm`}>
+                        {getVisualBadge(box.label)}
                       </div>
-                    )}
-                  </div>
-                ))}
+                      {isHighlighted && (
+                        <div className={`absolute -top-7 left-0 ${colors.tooltipBg} text-white text-[10px] px-2.5 py-1 rounded-md shadow-lg whitespace-nowrap z-30 font-medium backdrop-blur-sm`}>
+                          <Info className="w-2.5 h-2.5 inline mr-1 -mt-0.5" />
+                          {box.label}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
 
                 {showFixes && fixes.map((box, idx) => {
                   const severity = box.severity || 'warning';
@@ -438,30 +535,36 @@ const SlideCanvas: React.FC<SlideCanvasProps> = ({
             {/* Visual Element Overlays */}
             {analysis && (
               <div className="absolute inset-0 pointer-events-none">
-                {showVisuals && visuals.map((box, idx) => (
-                  <div
-                    key={`vis-${idx}`}
-                    style={{
-                      ...overlayStyleForImageMode(box),
-                    }}
-                    className={`absolute border-2 border-indigo-400/50 bg-indigo-400/5 transition-all duration-200 pointer-events-auto cursor-pointer ${
-                      hoveredVisual === idx || highlightedVisualKey === box.visualKey ? 'bg-indigo-400/20 border-indigo-500 z-20 ring-2 ring-indigo-300' : ''
-                    }`}
-                    onMouseEnter={() => setHoveredVisual(idx)}
-                    onMouseLeave={() => setHoveredVisual(null)}
-                    onClick={() => onVisualClick?.(box.visualKey, idx)}
-                  >
-                    <div className="absolute top-1 left-1 bg-indigo-700/90 text-white text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide shadow-sm">
-                      {getVisualBadge(box.label)}
-                    </div>
-                    {(hoveredVisual === idx || highlightedVisualKey === box.visualKey) && (
-                      <div className="absolute -top-7 left-0 bg-indigo-700 text-white text-[10px] px-2.5 py-1 rounded-md shadow-lg whitespace-nowrap z-30 font-medium backdrop-blur-sm">
-                        <Info className="w-2.5 h-2.5 inline mr-1 -mt-0.5" />
-                        {box.label}
+                {showVisuals && visuals.map((box, idx) => {
+                  const colors = getVisualColors(box.label);
+                  const isHighlighted = hoveredVisual === idx || highlightedVisualKey === box.visualKey;
+                  return (
+                    <div
+                      key={`vis-${idx}`}
+                      style={{
+                        ...overlayStyleForImageMode(box),
+                      }}
+                      className={`absolute border-2 transition-all duration-200 pointer-events-auto cursor-pointer ${
+                        isHighlighted 
+                          ? `${colors.highlightBorder} z-20 ring-2` 
+                          : `${colors.border} ${colors.bg} ${colors.bgHover}`
+                      }`}
+                      onMouseEnter={() => setHoveredVisual(idx)}
+                      onMouseLeave={() => setHoveredVisual(null)}
+                      onClick={() => onVisualClick?.(box.visualKey, idx)}
+                    >
+                      <div className={`absolute top-1 left-1 ${colors.badgeBg} text-white text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wide shadow-sm`}>
+                        {getVisualBadge(box.label)}
                       </div>
-                    )}
-                  </div>
-                ))}
+                      {isHighlighted && (
+                        <div className={`absolute -top-7 left-0 ${colors.tooltipBg} text-white text-[10px] px-2.5 py-1 rounded-md shadow-lg whitespace-nowrap z-30 font-medium backdrop-blur-sm`}>
+                          <Info className="w-2.5 h-2.5 inline mr-1 -mt-0.5" />
+                          {box.label}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
 
                 {/* Fix/Issue Overlays with severity-based styling */}
                 {showFixes && fixes.map((box, idx) => {

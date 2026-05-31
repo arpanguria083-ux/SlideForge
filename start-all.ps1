@@ -27,7 +27,7 @@ $frontendCmd = "npm run dev -- --host 127.0.0.1 --port 3000"
 
 $backendDataDir = Join-Path $backendDir "data"
 $backendTmpDir = Join-Path $backendDataDir "tmp"
-$backendCacheDir = Join-Path $backendDataDir "surya_models"
+$backendCacheDir = Join-Path $backendDataDir "ocr_models"
 
 $backendLaunch = @"
 Set-Location -LiteralPath '$backendDir'

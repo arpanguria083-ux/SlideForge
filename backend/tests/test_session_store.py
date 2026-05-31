@@ -49,3 +49,41 @@ def test_session_store_marks_stale_inflight_failed(tmp_path):
     assert loaded is not None
     assert loaded["status"] == "failed"
     assert "failure_reason" in loaded
+
+
+def test_session_store_load_respects_ttl(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(str(db_path))
+
+    session_id = "expired"
+    state = {
+        "status": "created",
+        "created_at_ts": 1.0,
+        "last_access_ts": 1.0,
+        "client_namespace": "acme",
+    }
+    store.save(session_id, state)
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET last_accessed = 0 WHERE session_id = ?",
+            (session_id,),
+        )
+
+    assert store.load(session_id, ttl_seconds=1) is None
+
+
+def test_session_store_delete_expired_removes_old_rows(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SQLiteSessionStore(str(db_path))
+
+    store.save("old", {"status": "created", "created_at_ts": 1.0, "last_access_ts": 1.0})
+    store.save("fresh", {"status": "created", "created_at_ts": 1.0, "last_access_ts": 1.0})
+
+    with store._connect() as conn:
+        conn.execute("UPDATE sessions SET last_accessed = 0 WHERE session_id = 'old'")
+
+    expired_ids = store.delete_expired(ttl_seconds=1)
+    assert expired_ids == ["old"]
+    assert store.load("old") is None
+    assert store.load("fresh") is not None

@@ -1,6 +1,7 @@
 import re
 import os
 import asyncio
+import logging
 from dataclasses import dataclass, field
 
 from ..models.schemas import Annotation
@@ -55,6 +56,9 @@ RECOMMENDATION_NO_VERB_PATTERNS = [
 
 
 from ..services.language_tool_client import LanguageToolClient  # noqa: E402
+
+
+_logger_lang = logging.getLogger("slideforge.language_agent")
 
 
 class LanguageAnalysisAgent:
@@ -125,16 +129,17 @@ If no issues, return [].
             return [
                 Annotation(
                     slide_index=slide_index,
-                    text=issue.get("text", text[:20]),
+                    text=issue.get("text", text[:20]) if isinstance(issue, dict) else text[:20],
                     category="quality",
                     severity="suggestion",
-                    message=issue.get("message", "Professional quality issue"),
-                    suggestion=issue.get("suggestion"),
+                    message=issue.get("message", "Professional quality issue") if isinstance(issue, dict) else "Professional quality issue",
+                    suggestion=issue.get("suggestion") if isinstance(issue, dict) else None,
                 )
                 for issue in issues
+                if isinstance(issue, dict)
             ]
         except Exception as e:
-            print(f"LLM quality check failed: {e}")
+            _logger_lang.error("LLM quality check failed", exc_info=e)
             return []
 
     async def _check_tone_llm(self, text: str, slide_index: int) -> list[Annotation]:
@@ -155,12 +160,13 @@ If no issues, return [].
             return [
                 Annotation(
                     slide_index=slide_index,
-                    text=issue.get("text", ""),
+                    text=issue.get("text", "") if isinstance(issue, dict) else "",
                     category="tone",
                     severity="suggestion",
-                    message=issue.get("message", "Tone improvement"),
+                    message=issue.get("message", "Tone improvement") if isinstance(issue, dict) else "Tone improvement",
                 )
                 for issue in issues
+                if isinstance(issue, dict)
             ]
         except Exception:
             return []
@@ -411,8 +417,6 @@ If no issues, return [].
                 )
             return annotations
         except Exception as e:
-            import logging
-
             logging.error(f"Tone consistency check failed: {e}")
             return []
 
@@ -442,7 +446,7 @@ If no issues, return [].
                 return {int(k): v for k, v in parsed.items()}
             return {}
         except Exception as e:
-            print(f"Tone drift summary failed: {e}")
+            _logger_lang.error("Tone drift summary failed", exc_info=e)
             return {
                 s[
                     "index"

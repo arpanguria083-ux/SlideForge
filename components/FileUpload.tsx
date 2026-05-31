@@ -8,21 +8,44 @@ import {
   FolderOpen,
   KeyRound,
   Loader2,
-  MonitorPlay,
   Save,
   Server,
   Settings2,
   ShieldCheck,
   Sparkles,
 } from 'lucide-react';
-import { apiService, HistoryItem, LlmProviderResponse, UpdateLlmProviderPayload } from '../services/apiService';
+import ErrorCard from './ErrorCard';
+import {
+  apiService,
+  ApiError,
+  DiagnosticsResponse,
+  HistoryItem,
+  LlmProviderResponse,
+  UpdateLlmProviderPayload,
+} from '../services/apiService';
+import { RuntimeAssetStatusResponse, OcrBackendsResponse, OcrJobStatus } from '../types';
 
 interface FileUploadProps {
   onUpload: (files: File[]) => void;
   isProcessing: boolean;
+  processingStatus?: RuntimeAssetStatusResponse | null;
+  progressLabel?: string | null;
   onError?: (msg: string) => void;
   onOpenHistory: (fingerprint: string) => void;
+  onOpenDiagnostics?: () => void;
+  onOpenOcrSetup?: () => void;
+  onRequestOcrDownload?: (backendId?: string) => void;
+  ocrJobId?: string | null;
+  ocrJobStatus?: OcrJobStatus | null;
 }
+
+const formatBytes = (value: number) => {
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const exponent = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const scaled = value / 1024 ** exponent;
+  return `${scaled >= 10 || exponent === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[exponent]}`;
+};
 
 const providerOptions = [
   {
@@ -80,7 +103,83 @@ const formatRelativeTime = (value: string) => {
 
 const normalizeBaseUrl = (value: string) => value.trim().replace(/\/+$/, '');
 
-const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError, onOpenHistory }) => {
+const copyText = async (value: string) => {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const el = document.createElement('textarea');
+    el.value = value;
+    el.style.position = 'fixed';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+  }
+};
+
+type SettingsState =
+  | 'idle'
+  | 'editing'
+  | 'dirty'
+  | 'testing'
+  | 'tested-ok'
+  | 'tested-fail'
+  | 'saving'
+  | 'saved'
+  | 'error';
+
+type StructuredUiError = {
+  title: string;
+  body: string;
+  hint?: string;
+  context?: {
+    requestId?: string | null;
+    timestamp?: string | null;
+    endpoint?: string | null;
+    status?: number;
+  };
+  raw?: string;
+};
+
+const buildStructuredUiError = (error: unknown, fallbackTitle: string): StructuredUiError => {
+  if (error instanceof ApiError) {
+    return {
+      title: error.title || fallbackTitle,
+      body: error.message || fallbackTitle,
+      hint: error.hint,
+      context: error.context,
+      raw: JSON.stringify(
+        {
+          message: error.message,
+          code: error.code,
+          title: error.title,
+          hint: error.hint,
+          context: error.context,
+        },
+        null,
+        2
+      ),
+    };
+  }
+
+  if (error instanceof Error) {
+    return {
+      title: fallbackTitle,
+      body: error.message || fallbackTitle,
+      raw: error.stack || error.message,
+    };
+  }
+
+  return {
+    title: fallbackTitle,
+    body: fallbackTitle,
+    raw: String(error),
+  };
+};
+
+const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, processingStatus, progressLabel, onError, onOpenHistory, onOpenDiagnostics, onOpenOcrSetup, onRequestOcrDownload, ocrJobId, ocrJobStatus }) => {
   const [providerConfig, setProviderConfig] = useState<LlmProviderResponse | null>(null);
   const [providerDraft, setProviderDraft] = useState<string>('api');
   const [apiBaseUrl, setApiBaseUrl] = useState('');
@@ -91,8 +190,12 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
   const [loadingProvider, setLoadingProvider] = useState(false);
   const [savingProvider, setSavingProvider] = useState(false);
   const [providerFeedback, setProviderFeedback] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
+  const [settingsState, setSettingsState] = useState<SettingsState>('idle');
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [testMessage, setTestMessage] = useState<string>('');
+  const [structuredError, setStructuredError] = useState<StructuredUiError | null>(null);
+  const [lastDiagnostics, setLastDiagnostics] = useState<DiagnosticsResponse | null>(null);
+  const [loadingDiagnostics, setLoadingDiagnostics] = useState(false);
   const [recentHistory, setRecentHistory] = useState<HistoryItem[]>([]);
 
   const applyProviderConfigToDraft = useCallback((data: LlmProviderResponse, nextProvider?: string) => {
@@ -108,20 +211,36 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
   }, []);
 
   useEffect(() => {
+    let isCancelled = false;
     setLoadingProvider(true);
 
-    Promise.all([apiService.getLlmProvider(), apiService.getRecentHistory()])
-      .then(([providerData, historyData]) => {
+    Promise.all([
+      apiService.getLlmProvider(),
+      apiService.getRecentHistory(),
+      apiService.getDiagnostics().catch(() => null),
+    ])
+      .then(([providerData, historyData, diagnostics]) => {
+        if (isCancelled) return;
         applyProviderConfigToDraft(providerData);
+        setSettingsState('idle');
         setRecentHistory(historyData.items || []);
+        if (diagnostics) {
+          setLastDiagnostics(diagnostics);
+        }
       })
       .catch((err: Error) => {
+        if (isCancelled) return;
         console.error(err);
         onError?.(err.message || 'Failed to load workspace settings.');
       })
       .finally(() => {
+        if (isCancelled) return;
         setLoadingProvider(false);
       });
+
+    return () => {
+      isCancelled = true;
+    };
   }, [applyProviderConfigToDraft, onError]);
 
   const handleProviderSelect = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -129,6 +248,8 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
     setProviderFeedback(null);
     setTestStatus('idle');
     setTestMessage('');
+    setStructuredError(null);
+    setSettingsState('editing');
 
     if (providerConfig) {
       applyProviderConfigToDraft(providerConfig, nextProvider);
@@ -142,6 +263,8 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
     const nextValue = Number(e.target.value) || 1024;
     setLocalContextWindow(nextValue);
     setProviderFeedback(null);
+    setStructuredError(null);
+    setSettingsState('editing');
   };
 
   const isValidFile = (file: File) =>
@@ -211,6 +334,36 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
     return providerChanged || baseUrlChanged || modelChanged || contextChanged || apiKeyTouched;
   }, [apiKeyTouched, localContextWindow, model, normalizedBaseUrl, providerConfig, providerDraft, showRuntimeInputs]);
 
+  useEffect(() => {
+    setSettingsState((prev) => {
+      if (loadingProvider || !providerConfig) {
+        return prev;
+      }
+      if (savingProvider) {
+        return 'saving';
+      }
+      if (testStatus === 'testing') {
+        return 'testing';
+      }
+      if (testStatus === 'success') {
+        return 'tested-ok';
+      }
+      if (testStatus === 'error') {
+        return 'tested-fail';
+      }
+      if (isProviderDirty) {
+        return prev === 'idle' ? 'editing' : 'dirty';
+      }
+      if (prev === 'saving' || prev === 'tested-ok') {
+        return 'saved';
+      }
+      if (prev === 'error') {
+        return 'error';
+      }
+      return 'idle';
+    });
+  }, [isProviderDirty, loadingProvider, providerConfig, savingProvider, testStatus]);
+
   const uploadHighlights = useMemo(
     () => [
       {
@@ -231,6 +384,52 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
     ],
     []
   );
+
+  const runtimeOcrStatus = processingStatus?.ocr ?? null;
+  const cachedAssetCount = runtimeOcrStatus?.files?.length ?? 0;
+  const cachedModelSize = useMemo(
+    () => (runtimeOcrStatus?.files || []).reduce((sum, file) => sum + (file.size_bytes || 0), 0),
+    [runtimeOcrStatus?.files]
+  );
+
+  const [ocrBackendsInfo, setOcrBackendsInfo] = useState<OcrBackendsResponse | null>(null);
+
+  // Always poll OCR backend state so the sidebar card is accurate even when idle.
+  // Speed up polling to 3 s while a download job is running; slow to 12 s otherwise.
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const info = await apiService.getOcrBackends();
+        if (!cancelled) setOcrBackendsInfo(info);
+      } catch {
+        // ignore polling errors
+      }
+    };
+
+    void load();
+    const intervalMs = ocrJobStatus?.status === 'running' ? 3000 : 12000;
+    const interval = window.setInterval(load, intervalMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [ocrJobStatus?.status]);
+
+  const cacheSizeBytes = useMemo(() => {
+    if (ocrBackendsInfo && Array.isArray(ocrBackendsInfo.backends)) {
+      return ocrBackendsInfo.backends.reduce((s, b) => s + (b?.bytes_present || 0), 0);
+    }
+    return cachedModelSize;
+  }, [ocrBackendsInfo, cachedModelSize]);
+
+  const activeBackendLabel = useMemo(() => {
+    if (!ocrBackendsInfo) return null;
+    const activeId = ocrBackendsInfo.active_backend;
+    const info = ocrBackendsInfo.backends?.find((b) => b.id === activeId);
+    return info?.label || activeId;
+  }, [ocrBackendsInfo]);
 
   const saveProviderConfig = useCallback(
     async (options?: { silentSuccess?: boolean }) => {
@@ -255,12 +454,15 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
         payload.local_context_window = localContextWindow;
       }
 
+      setSettingsState('saving');
       setSavingProvider(true);
       setProviderFeedback(null);
+      setStructuredError(null);
 
       try {
         const updated = await apiService.setLlmProvider(payload);
         applyProviderConfigToDraft(updated);
+        setSettingsState('saved');
         if (!options?.silentSuccess) {
           setProviderFeedback({
             tone: 'success',
@@ -269,7 +471,10 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
         }
         return updated;
       } catch (err: any) {
-        const message = err.message || 'Failed to save provider settings.';
+        const structured = buildStructuredUiError(err, 'Could not save provider settings');
+        const message = structured.body || 'Failed to save provider settings.';
+        setStructuredError(structured);
+        setSettingsState('error');
         setProviderFeedback({ tone: 'error', text: message });
         throw err;
       } finally {
@@ -279,35 +484,10 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
     [apiKey, apiKeyTouched, applyProviderConfigToDraft, localContextWindow, model, normalizedBaseUrl, providerConfig, providerDraft, showRuntimeInputs]
   );
 
-  const handleSaveProviderConfig = async () => {
-    setTestStatus('idle');
-    setTestMessage('');
-
-    if (!providerConfig) {
-      setProviderFeedback({
-        tone: 'error',
-        text: 'Provider settings are still loading. Wait a moment and try again.',
-      });
-      return;
-    }
-
-    if (!isProviderDirty) {
-      setProviderFeedback({
-        tone: 'success',
-        text: 'No unsaved changes. Provider settings are already applied.',
-      });
-      return;
-    }
-
-    try {
-      await saveProviderConfig();
-    } catch {
-      return;
-    }
-  };
-
   const handleTestConnection = async () => {
     setTestStatus('testing');
+    setSettingsState('testing');
+    setStructuredError(null);
     setTestMessage(isProviderDirty ? 'Applying settings and testing the selected provider...' : 'Testing the selected provider...');
 
     try {
@@ -317,12 +497,80 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
 
       const result = await apiService.testLlmConnection();
       setTestStatus('success');
-      setTestMessage(`Connected to ${providerOptions.find((option) => option.value === result.provider)?.label || result.provider} using ${result.model}.`);
+      setSettingsState('tested-ok');
+      const latencyLabel = typeof result.latency_ms === 'number' ? ` (${result.latency_ms}ms)` : '';
+      setTestMessage(`Connected to ${providerOptions.find((option) => option.value === result.provider)?.label || result.provider} using ${result.model}${latencyLabel}.`);
+
+      try {
+        const diagnostics = await apiService.getDiagnostics();
+        setLastDiagnostics(diagnostics);
+      } catch {
+        // Non-blocking diagnostics refresh
+      }
+
       window.setTimeout(() => setTestStatus('idle'), 4000);
-    } catch (err: any) {
+    } catch (err: unknown) {
       setTestStatus('error');
-      setTestMessage(err.message || 'Connection test failed.');
+      setSettingsState('tested-fail');
+      const structured = buildStructuredUiError(err, 'Could not reach LLM provider');
+      setStructuredError(structured);
+      setTestMessage(structured.body || 'Connection test failed.');
     }
+  };
+
+  const handleSaveAndTest = async () => {
+    setProviderFeedback(null);
+    setStructuredError(null);
+
+    if (!providerConfig) {
+      const details: StructuredUiError = {
+        title: 'Provider settings are still loading',
+        body: 'Wait for settings to load before saving and testing.',
+      };
+      setStructuredError(details);
+      setSettingsState('error');
+      return;
+    }
+
+    if (isProviderDirty) {
+      try {
+        await saveProviderConfig({ silentSuccess: true });
+      } catch {
+        return;
+      }
+    }
+
+    await handleTestConnection();
+  };
+
+  const refreshDiagnostics = async () => {
+    setLoadingDiagnostics(true);
+    try {
+      const diagnostics = await apiService.getDiagnostics();
+      setLastDiagnostics(diagnostics);
+    } catch (err) {
+      const structured = buildStructuredUiError(err, 'Failed to load diagnostics');
+      setStructuredError(structured);
+    } finally {
+      setLoadingDiagnostics(false);
+    }
+  };
+
+  const copyStructuredError = async () => {
+    if (!structuredError) return;
+    const payload = [
+      `title: ${structuredError.title}`,
+      `body: ${structuredError.body}`,
+      structuredError.hint ? `hint: ${structuredError.hint}` : null,
+      structuredError.context?.requestId ? `requestId: ${structuredError.context.requestId}` : null,
+      structuredError.context?.endpoint ? `endpoint: ${structuredError.context.endpoint}` : null,
+      structuredError.context?.status ? `status: ${structuredError.context.status}` : null,
+      structuredError.context?.timestamp ? `timestamp: ${structuredError.context.timestamp}` : null,
+      structuredError.raw ? `raw: ${structuredError.raw}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    await copyText(payload);
   };
 
   return (
@@ -412,8 +660,89 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
                     <div>
                       <p className="text-lg font-semibold text-indigo-950">Preparing your review workspace</p>
                       <p className="mt-1 text-sm text-indigo-700">
-                        Uploading the file, reading the slides, and setting up recommendations.
+                        {runtimeOcrStatus?.download_active
+                          ? runtimeOcrStatus.message
+                          : progressLabel || 'Uploading the file, reading the slides, and setting up recommendations.'}
                       </p>
+                      {runtimeOcrStatus && (
+                        <div className="mx-auto mt-5 max-w-2xl rounded-[1.5rem] border border-indigo-100 bg-white/90 p-5 text-left shadow-[0_18px_50px_rgba(79,70,229,0.12)]">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-indigo-500">
+                                {runtimeOcrStatus.download_active ? 'Downloading OCR assets' : 'OCR engine status'}
+                              </div>
+                              <div className="mt-2 text-base font-semibold text-slate-950">
+                                {runtimeOcrStatus.message}
+                              </div>
+                            </div>
+                            <div className="rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1 text-xs font-semibold capitalize text-indigo-700">
+                              {runtimeOcrStatus.phase.replace(/_/g, ' ')}
+                            </div>
+                          </div>
+                          <div className="mt-4 grid gap-3 sm:grid-cols-4">
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                              <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Setup</div>
+                              <div className="mt-2 text-sm font-semibold text-slate-900">
+                                {runtimeOcrStatus.download_required ? 'First-run download' : 'Already cached'}
+                              </div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                              <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Cached files</div>
+                              <div className="mt-2 text-sm font-semibold text-slate-900">{cachedAssetCount}</div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                              <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Cache size</div>
+                              <div className="mt-2 text-sm font-semibold text-slate-900">{formatBytes(cacheSizeBytes)}</div>
+                            </div>
+                            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                              <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Active OCR</div>
+                              <div className="mt-2 text-sm font-semibold text-slate-900">{activeBackendLabel || 'Unknown'}</div>
+                            </div>
+                          </div>
+                          <div className="mt-3 rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+                            {runtimeOcrStatus.offline_ready
+                              ? 'Offline-ready: OCR assets are cached locally and future runs use local files only.'
+                              : 'Online for first-run: SlideForge downloads OCR assets once, then switches to local cached reuse.'}
+                          </div>
+                          {/* Compact per-backend status + manage link */}
+                          <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex flex-wrap gap-2">
+                              {ocrBackendsInfo?.backends.map((b) => {
+                                const isActive = !!b.active;
+                                const isDownloading = ocrJobStatus?.backend_id === b.id && ocrJobStatus?.status === 'running';
+                                const pctDone = isDownloading && (ocrJobStatus?.bytes_total ?? 0) > 0
+                                  ? Math.round(((ocrJobStatus?.bytes_done ?? 0) / (ocrJobStatus?.bytes_total ?? 1)) * 100)
+                                  : null;
+                                return (
+                                  <span
+                                    key={b.id}
+                                    className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold ${
+                                      isActive
+                                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                        : isDownloading
+                                        ? 'bg-indigo-100 text-indigo-800 border border-indigo-200'
+                                        : b.ready
+                                        ? 'bg-slate-100 text-slate-600 border border-slate-200'
+                                        : 'bg-white text-slate-400 border border-slate-200'
+                                    }`}
+                                  >
+                                    {isActive ? '✓ ' : isDownloading ? '⬇ ' : b.ready ? '● ' : '○ '}
+                                    {b.label}
+                                    {isDownloading && pctDone !== null ? ` ${pctDone}%` : ''}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => onOpenOcrSetup?.()}
+                              className="inline-flex items-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
+                            >
+                              Manage OCR
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : (
@@ -470,12 +799,24 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
                     Save the runtime provider here before uploading. Cloud AI needs both an API base URL and an API key.
                   </p>
                 </div>
-                <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 text-slate-700">
-                  <Settings2 className="h-5 w-5" />
+                <div className="flex items-center gap-2">
+                  {onOpenDiagnostics && (
+                    <button
+                      type="button"
+                      onClick={onOpenDiagnostics}
+                      className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                    >
+                      <Server className="h-3.5 w-3.5" />
+                      Open diagnostics
+                    </button>
+                  )}
+                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 text-slate-700">
+                    <Settings2 className="h-5 w-5" />
+                  </div>
                 </div>
               </div>
 
-              <div className="mt-5 rounded-[1.5rem] border border-slate-200 bg-[linear-gradient(135deg,#f8fafc_0%,#eef2ff_100%)] p-5">
+                <div className="mt-5 rounded-[1.5rem] border border-slate-200 bg-[linear-gradient(135deg,#f8fafc_0%,#eef2ff_100%)] p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <div className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">Selected provider</div>
@@ -502,6 +843,62 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
               </div>
 
               <div className="mt-5 space-y-4">
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-sm leading-6 text-amber-900">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div>
+                      <div className="font-semibold">Offline and online usage</div>
+                      <div className="mt-1">
+                        Local providers keep requests on this machine when they point to local servers. Cloud AI sends prompts and uploaded deck content to the remote endpoint you configure. Some local OCR or ML features may still download model weights on first use unless those assets are already cached offline.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">Settings state</div>
+                      <div className="mt-1 text-sm font-semibold text-slate-900">
+                        {settingsState === 'idle' && 'Idle'}
+                        {settingsState === 'editing' && 'Editing'}
+                        {settingsState === 'dirty' && 'Changes pending'}
+                        {settingsState === 'testing' && 'Testing connection'}
+                        {settingsState === 'tested-ok' && 'Connection verified'}
+                        {settingsState === 'tested-fail' && 'Connection failed'}
+                        {settingsState === 'saving' && 'Saving settings'}
+                        {settingsState === 'saved' && 'Saved'}
+                        {settingsState === 'error' && 'Error'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={refreshDiagnostics}
+                      disabled={loadingDiagnostics}
+                      className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                    >
+                      {loadingDiagnostics ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Server className="h-3.5 w-3.5" />}
+                      Refresh diagnostics
+                    </button>
+                  </div>
+                  {lastDiagnostics && (
+                    <div className="mt-3 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
+                      <div className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+                        Backend: <span className="font-semibold text-slate-800">{lastDiagnostics.backend.status}</span>
+                      </div>
+                      <div className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+                        OCR: <span className="font-semibold text-slate-800">{lastDiagnostics.ocr.state}</span>
+                      </div>
+                      <div className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+                        Warmup: <span className="font-semibold text-slate-800">{lastDiagnostics.startup.model_warmup_state}</span>
+                      </div>
+                      <div className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
+                        Last analysis: <span className="font-semibold text-slate-800">{lastDiagnostics.analysis.last_status}</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <label className="block">
                   <span className="mb-2 block text-sm font-semibold text-slate-700">Provider</span>
                   <select
@@ -535,6 +932,8 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
                         onChange={(e) => {
                           setApiBaseUrl(e.target.value);
                           setProviderFeedback(null);
+                          setStructuredError(null);
+                          setSettingsState('editing');
                         }}
                         placeholder={providerMeta.baseUrlPlaceholder}
                         className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-100"
@@ -549,6 +948,8 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
                         onChange={(e) => {
                           setModel(e.target.value);
                           setProviderFeedback(null);
+                          setStructuredError(null);
+                          setSettingsState('editing');
                         }}
                         placeholder={providerMeta.modelPlaceholder}
                         className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-100"
@@ -562,11 +963,13 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
                         <input
                           type="password"
                           value={apiKey}
-                          onChange={(e) => {
-                            setApiKey(e.target.value);
-                            setApiKeyTouched(true);
-                            setProviderFeedback(null);
-                          }}
+                        onChange={(e) => {
+                          setApiKey(e.target.value);
+                          setApiKeyTouched(true);
+                          setProviderFeedback(null);
+                          setStructuredError(null);
+                          setSettingsState('editing');
+                        }}
                           placeholder={providerDraft === 'api' ? 'Paste the cloud API key' : 'Optional unless your local server requires auth'}
                           className="w-full rounded-xl border border-slate-200 bg-white py-3 pl-11 pr-4 text-sm text-slate-800 outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-100"
                         />
@@ -627,21 +1030,26 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
 
                 <div className="flex flex-wrap items-center gap-3">
                   <button
-                    onClick={handleSaveProviderConfig}
+                    onClick={handleSaveAndTest}
                     disabled={loadingProvider || savingProvider || testStatus === 'testing' || !providerConfig}
                     className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-black disabled:opacity-50"
                   >
-                    {savingProvider ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                    {isProviderDirty ? 'Save and apply' : 'Already applied'}
-                  </button>
-
-                  <button
-                    onClick={handleTestConnection}
-                    disabled={loadingProvider || savingProvider || testStatus === 'testing' || !providerConfig}
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 disabled:opacity-50"
-                  >
-                    {testStatus === 'testing' ? <Loader2 className="h-4 w-4 animate-spin" /> : <MonitorPlay className="h-4 w-4" />}
-                    {isProviderDirty ? 'Save and test connection' : 'Test connection'}
+                    {settingsState === 'saving' || settingsState === 'testing' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : settingsState === 'tested-ok' ? (
+                      <CheckCircle2 className="h-4 w-4" />
+                    ) : settingsState === 'tested-fail' ? (
+                      <AlertTriangle className="h-4 w-4" />
+                    ) : (
+                      <Save className="h-4 w-4" />
+                    )}
+                    {settingsState === 'testing'
+                      ? 'Testing...'
+                      : settingsState === 'tested-ok'
+                        ? 'Connected'
+                        : settingsState === 'tested-fail'
+                          ? 'Retry Save & test'
+                          : 'Save & test'}
                   </button>
                 </div>
 
@@ -658,7 +1066,85 @@ const FileUpload: React.FC<FileUploadProps> = ({ onUpload, isProcessing, onError
                     {testMessage}
                   </div>
                 )}
+
+                {structuredError && (
+                  <ErrorCard
+                    title={structuredError.title}
+                    body={structuredError.hint ? `${structuredError.body} ${structuredError.hint}` : structuredError.body}
+                    context={structuredError.context}
+                    actions={[
+                      {
+                        label: 'Test connection',
+                        onClick: handleSaveAndTest,
+                      },
+                      {
+                        label: 'LM Studio docs',
+                        href: 'https://lmstudio.ai/docs/local-server',
+                      },
+                    ]}
+                    onCopyError={copyStructuredError}
+                  />
+                )}
               </div>
+            </section>
+
+            <section className="rounded-[1.75rem] border border-slate-200 bg-white p-6 shadow-[0_22px_60px_rgba(15,23,42,0.06)]">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="sf-eyebrow">OCR Engine</div>
+                  <h3 className="mt-1 text-base font-semibold text-slate-950">
+                    {activeBackendLabel ? activeBackendLabel : 'Not configured'}
+                  </h3>
+                </div>
+                <div className="flex items-center gap-2">
+                  {ocrBackendsInfo && (
+                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                      ocrBackendsInfo.backends.find(b => b.id === ocrBackendsInfo.active_backend)?.ready
+                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        : 'bg-amber-50 text-amber-700 border border-amber-200'
+                    }`}>
+                      {ocrBackendsInfo.backends.find(b => b.id === ocrBackendsInfo.active_backend)?.ready ? 'Ready' : 'Not ready'}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => onOpenOcrSetup?.()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+                  >
+                    <Settings2 className="h-3.5 w-3.5" />
+                    Manage
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {ocrBackendsInfo?.backends.map((b) => {
+                  const isActive = !!b.active;
+                  const isDownloading = ocrJobStatus?.backend_id === b.id && ocrJobStatus?.status === 'running';
+                  const dlPct = isDownloading && (ocrJobStatus?.bytes_total ?? 0) > 0
+                    ? Math.round(((ocrJobStatus?.bytes_done ?? 0) / (ocrJobStatus?.bytes_total ?? 1)) * 100)
+                    : null;
+                  return (
+                    <span key={b.id} className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                      isActive ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                        : isDownloading ? 'bg-indigo-100 text-indigo-800 border border-indigo-200'
+                        : b.ready ? 'bg-slate-100 text-slate-500 border border-slate-200'
+                        : 'bg-white text-slate-400 border border-slate-200'
+                    }`}>
+                      {isActive ? '✓' : isDownloading ? '⬇' : b.ready ? '●' : '○'}{' '}
+                      {b.label}
+                      {isDownloading && dlPct !== null ? ` ${dlPct}%` : ''}
+                    </span>
+                  );
+                })}
+                {!ocrBackendsInfo && (
+                  <span className="text-xs text-slate-400">Loading…</span>
+                )}
+              </div>
+              {ocrBackendsInfo && (
+                <div className="mt-2 text-xs text-slate-400">
+                  Cache: {formatBytes(cacheSizeBytes)} · {ocrBackendsInfo.backends.filter(b => b.ready).length}/{ocrBackendsInfo.backends.length} engines ready
+                </div>
+              )}
             </section>
 
             <section className="rounded-[1.75rem] border border-slate-200 bg-white p-6 shadow-[0_22px_60px_rgba(15,23,42,0.06)]">

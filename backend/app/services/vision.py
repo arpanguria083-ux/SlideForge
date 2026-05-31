@@ -26,9 +26,27 @@ class LMStudioVisionModel:
         api_key: str = "lm-studio",
     ):
         self.base_url = base_url or os.getenv(
-            "API_BASE_URL", "http://localhost:1234/v1"
+            "LM_STUDIO_BASE_URL", "http://localhost:1234/v1"
         )
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("LM_STUDIO_API_KEY", "lm-studio")
+        self._warmup_task = None
+
+    async def prewarm(self) -> bool:
+        """Pre-warm the vision model by making a test request. Eliminates cold-start latency."""
+        try:
+            # Create a minimal 1x1 white test image
+            test_image = Image.new('RGB', (1, 1), color='white')
+            logger.info("Vision model pre-warming started...")
+            result = await self.analyze_image(test_image, "Describe this image briefly.")
+            if "[Vision API error" not in str(result):
+                logger.info("Vision model pre-warming completed successfully")
+                return True
+            else:
+                logger.warning(f"Vision model pre-warming failed: {result}")
+                return False
+        except Exception as e:
+            logger.warning(f"Vision model pre-warming exception: {e}")
+            return False
 
     def _image_to_base64(self, image: Image.Image, max_size: int = 1024) -> str:
         """Convert PIL image to base64, resizing if too large."""
@@ -243,19 +261,29 @@ class FallbackVisionModel:
 
 def create_vision_model() -> LMStudioVisionModel:
     """Create the vision model — always use LM Studio multimodal when available."""
-    # Check if LM Studio is running
+    import urllib.parse
+
+    base_url = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 1234
+    except Exception:
+        host = "localhost"
+        port = 1234
+
     try:
         import socket
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
-            if s.connect_ex(("localhost", 1234)) == 0:
-                logger.info("LM Studio detected — using multimodal vision endpoint")
-                return LMStudioVisionModel()
+            if s.connect_ex((host, port)) == 0:
+                logger.info("LM Studio detected at %s:%s — using multimodal vision endpoint", host, port)
+                return LMStudioVisionModel(base_url=base_url)
     except Exception:
         pass
 
-    logger.warning("LM Studio not detected — using fallback vision model")
+    logger.warning("LM Studio not detected at %s:%s — using fallback vision model", host, port)
     return FallbackVisionModel()
 
 
